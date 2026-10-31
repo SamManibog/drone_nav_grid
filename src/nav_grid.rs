@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, io, path::Path};
 
 use nalgebra::SimdPartialOrd;
 
@@ -323,6 +323,8 @@ impl OccupiedExploredNavGrid {
         }
     }
 
+    ///
+
     /// generate a a path using funnelled astar algorithm to get as near as possible to the given point
     /// attempts to get as near as possible to the end point within the given search size
     /// if no path exists, returns an empty vector
@@ -357,5 +359,17 @@ impl OccupiedExploredNavGrid {
             .into_iter()
             .map(|p| self.world_point_from_cell_center(self.voxels.get_cell_position(p).unwrap()))
             .collect()
+    }
+
+    /// writes a Wavefront .obj mesh of every occupied cell
+    pub fn export_occupied_obj(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.voxels
+            .export_obj(|_, cstate, _| cstate.is_occupied(), path)
+    }
+
+    /// writes a Wavefront .obj mesh of every explored, unoccupied cell
+    pub fn export_explored_obj(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.voxels
+            .export_obj(|_, cstate, _| cstate == ExplOccCell::EmptyExplored, path)
     }
 }

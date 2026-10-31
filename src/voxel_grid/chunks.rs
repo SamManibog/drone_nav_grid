@@ -342,6 +342,24 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Chunk<C, 
         traversal_result
     }
 
+    /// evaluates `predicate(local index, cell, user state)` for every cell of the chunk and
+    /// returns the set of local indices for which it returned true.
+    /// returns None if no indices matched the predicate
+    pub fn mask_where(
+        &self,
+        mut predicate: impl FnMut(usize, C, &T) -> bool,
+    ) -> Option<BitSet<u64>> {
+        let mut mask = BitSet::<u64>::with_capacity_general(Self::SIZE);
+        let mut any = false;
+        for (index, &cell) in self.cells.iter().enumerate() {
+            if predicate(index, cell, &self.user_state) {
+                mask.insert(index);
+                any = true;
+            }
+        }
+        any.then_some(mask)
+    }
+
     /// returns an iterator over the cells in this chunk
     /// returns none if not initialized
     pub fn iter(&self) -> Option<ChunkIter<'_, C, S, AabbIndexIter<S>>> {
