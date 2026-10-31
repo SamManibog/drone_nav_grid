@@ -32,6 +32,14 @@ pub fn floor_fvec3(fvec3: &FVec3) -> IVec3 {
     )
 }
 
+pub fn ivec3_dist_sq(p1: &IVec3, p2: &IVec3) -> isize {
+    let d_x = p1.x - p2.x;
+    let d_y = p1.y - p2.y;
+    let d_z = p1.z - p2.z;
+
+    d_x * d_x + d_y * d_y + d_z * d_z
+}
+
 impl<'a, G: Grid<'a>> GridExt<'a> for G {}
 
 #[derive(Debug, Clone, Copy)]
@@ -408,9 +416,9 @@ impl IDistanceHeuristic for IManhattanDistance {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct IDistanceSquared;
+pub struct IDistance;
 
-impl IDistanceHeuristic for IDistanceSquared {
+impl IDistanceHeuristic for IDistance {
     fn apply(p1: IVec3, p2: IVec3) -> u64 {
         let x_dist = p1.x.abs_diff(p2.x) as u64;
         let y_dist = p1.y.abs_diff(p2.y) as u64;

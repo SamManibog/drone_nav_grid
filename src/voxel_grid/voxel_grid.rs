@@ -280,7 +280,6 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
     }
 
     /// runs astar between two points, with the given predicate indicating whether a cell is traversible
-    /// uses manhattan distance
     ///
     /// returns
     ///  - a path containing the end point of a path exists
@@ -433,7 +432,6 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
     }
 
     /// runs astar between two points, with the given predicate indicating whether a cell is traversible
-    /// uses manhattan distance for astar
     ///
     /// then uses greedy string pulling for path smoothing
     ///

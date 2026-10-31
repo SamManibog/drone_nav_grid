@@ -3,7 +3,9 @@ use std::{collections::HashSet, io, path::Path};
 use nalgebra::SimdPartialOrd;
 
 use crate::{
-    math::{Aabb, FVec3, IDistanceHeuristic, IDistanceSquared, IVec3, LineSegment, floor_fvec3},
+    math::{
+        Aabb, FVec3, IManhattanDistance, IVec3, LineSegment, floor_fvec3, ivec3_dist_sq
+    },
     voxel_grid::{
         cell_identifiers::{CellID, CellPosition},
         chunks::ChunkSize64,
@@ -316,7 +318,7 @@ impl OccupiedExploredNavGrid {
 
             self.voxels
                 .aabb_cell_initializing_for_each_mut(region, |pos, cell, _| {
-                    if IDistanceSquared::apply(*pos, *hit) as f32 <= margin_sq {
+                    if ivec3_dist_sq(&pos, &hit) as f32 <= margin_sq {
                         *cell = ExplOccCell::Occupied;
                     }
                 });
@@ -353,7 +355,7 @@ impl OccupiedExploredNavGrid {
         };
 
         self.voxels
-            .funnelled_astar::<IDistanceSquared>(start_cell, end_cell, search_size, |_, c| {
+            .funnelled_astar::<IManhattanDistance>(start_cell, end_cell, search_size, |_, c| {
                 ExplOccCell::is_occupied(&c)
             })
             .into_iter()
