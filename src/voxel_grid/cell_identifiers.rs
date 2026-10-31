@@ -9,7 +9,7 @@ use crate::{
 };
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChunkID(usize);
 
 impl ChunkID {
@@ -133,7 +133,7 @@ impl<S: ChunkSize> From<Option<Self>> for CellID<S> {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CellPosition(pub IVec3);
 
 impl Deref for CellPosition {
@@ -153,15 +153,15 @@ impl DerefMut for CellPosition {
 impl CellPosition {
     pub fn local_position<S: ChunkSize>(self) -> LocalCellPosition<S> {
         LocalCellPosition::new(IVec3::new(
-            self.0.x % S::SIDE_LENGTH as isize,
-            self.0.y % S::SIDE_LENGTH as isize,
-            self.0.z % S::SIDE_LENGTH as isize,
+            self.0.x.rem_euclid(S::SIDE_LENGTH as isize),
+            self.0.y.rem_euclid(S::SIDE_LENGTH as isize),
+            self.0.z.rem_euclid(S::SIDE_LENGTH as isize),
         ))
     }
 }
 
 #[repr(transparent)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct LocalCellPosition<S: ChunkSize>(pub IVec3, PhantomData<S>);
 
 impl<S: ChunkSize> Clone for LocalCellPosition<S> {
@@ -200,22 +200,6 @@ impl<S: ChunkSize> LocalCellPosition<S> {
         }
     }
 
-    pub fn entrywise_max(&self, other: &Self) -> Self {
-        Self::new(IVec3::new(
-            self.x.max(other.x),
-            self.y.max(other.y),
-            self.z.max(other.z),
-        ))
-    }
-
-    pub fn entrywise_min(&self, other: &Self) -> Self {
-        Self::new(IVec3::new(
-            self.x.min(other.x),
-            self.y.min(other.y),
-            self.z.min(other.z),
-        ))
-    }
-
     pub const fn from_index(local_index: usize) -> Self {
         let chunk_pos_x = local_index % S::SIDE_LENGTH;
         let temp_yz = local_index / S::SIDE_LENGTH;
@@ -252,7 +236,7 @@ impl<S: ChunkSize> Into<usize> for LocalCellPosition<S> {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkPosition(pub IVec3);
 
 impl Deref for ChunkPosition {

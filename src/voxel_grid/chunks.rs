@@ -1,11 +1,14 @@
 use std::{fmt::Debug, hash::Hash, marker::PhantomData};
 
 use bit_set::BitSet;
+use nalgebra::SimdPartialOrd;
 
 use crate::{
     math::{Aabb, AabbCellIter, FVec3, Grid, GridSegmentOverlapIter, IVec3, LineSegment},
     voxel_grid::cell_identifiers::LocalCellPosition,
 };
+
+use delegate::delegate;
 
 mod size_sealer {
     use super::{ChunkSize8, ChunkSize16, ChunkSize32, ChunkSize64};
@@ -99,15 +102,16 @@ ChunkSizeDef!(ChunkSize64, 6);
 impl<S: ChunkSize> Grid<'static> for S {
     type Cell = usize;
 
-    fn get_cell(&self, position: IVec3) -> Option<Self::Cell> {
-        if position.x >= Self::DIMENSIONS.x
+    fn get_cell(&self, position: IVec3) -> Option<usize> {
+        if position.x < 0
+            || position.y < 0
+            || position.z < 0
+            || position.x >= Self::DIMENSIONS.x
             || position.y >= Self::DIMENSIONS.y
             || position.z >= Self::DIMENSIONS.z
         {
-            std::hint::cold_path();
             return None;
         }
-
         Some(LocalCellPosition::<S>::new(position).index())
     }
 
@@ -123,10 +127,10 @@ pub trait ChunkTrait {
     type Cell: Copy + Default + PartialEq;
     type Size: ChunkSize;
 
-    const POWER_OF_TWO: usize = Self::Size::SIZE;
-    const SIDE_LENGTH: usize = Self::Size::SIDE_LENGTH;
-    const SIZE: usize = Self::Size::SIZE;
-    const DIMENSIONS: IVec3 = Self::Size::DIMENSIONS;
+    const POWER_OF_TWO: usize = <Self::Size as ChunkSize>::POWER_OF_TWO;
+    const SIDE_LENGTH: usize = <Self::Size as ChunkSize>::SIDE_LENGTH;
+    const SIZE: usize = <Self::Size as ChunkSize>::SIZE;
+    const DIMENSIONS: IVec3 = <Self::Size as ChunkSize>::DIMENSIONS;
 }
 
 impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> ChunkTrait
@@ -212,16 +216,8 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Chunk<C, 
         index: usize,
         mutator: impl FnOnce(usize, &mut C, &mut T) -> U,
     ) -> U {
-        debug_assert!(index < Self::SIZE);
-        debug_assert!(self.is_init());
-
-        unsafe {
-            mutator(
-                index,
-                self.cells.get_unchecked_mut(index),
-                &mut self.user_state,
-            )
-        }
+        assert!(self.is_init(), "chunk not initialized");
+        mutator(index, &mut self.cells[index], &mut self.user_state)
     }
 
     /// performs a depth-first traversal on a chunk starting from a given list of cells (predicate
@@ -246,10 +242,9 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Chunk<C, 
         // traverse start nodes
         for index in start_cells {
             debug_assert!(index < Self::SIZE);
-            if predicate(index, &self.cells[index], &self.user_state) {
+            if explored.insert(index) && predicate(index, &self.cells[index], &self.user_state) {
                 stack.push(index);
             }
-            explored.insert(index);
         }
 
         while let Some(curr_index) = stack.pop() {
@@ -268,13 +263,9 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Chunk<C, 
             // +x neighbor
             if x + 1 < side_len {
                 let neighbor_index = LocalCellPosition::<S>::new(IVec3::new(x + 1, y, z)).index();
-                if predicate(
-                    neighbor_index,
-                    &self.cells[neighbor_index],
-                    &self.user_state,
-                ) && !explored.contains(neighbor_index)
+                if explored.insert(neighbor_index)
+                    && predicate(neighbor_index, &self.cells[neighbor_index], &self.user_state)
                 {
-                    explored.insert(neighbor_index);
                     stack.push(neighbor_index);
                 }
             } else {
@@ -285,13 +276,9 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Chunk<C, 
             // -x neighbor
             if x - 1 >= 0 {
                 let neighbor_index = LocalCellPosition::<S>::new(IVec3::new(x - 1, y, z)).index();
-                if predicate(
-                    neighbor_index,
-                    &self.cells[neighbor_index],
-                    &self.user_state,
-                ) && !explored.contains(neighbor_index)
+                if explored.insert(neighbor_index)
+                    && predicate(neighbor_index, &self.cells[neighbor_index], &self.user_state)
                 {
-                    explored.insert(neighbor_index);
                     stack.push(neighbor_index);
                 }
             } else {
@@ -302,13 +289,9 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Chunk<C, 
             // +y neighbor
             if y + 1 < side_len {
                 let neighbor_index = LocalCellPosition::<S>::new(IVec3::new(x, y + 1, z)).index();
-                if predicate(
-                    neighbor_index,
-                    &self.cells[neighbor_index],
-                    &self.user_state,
-                ) && !explored.contains(neighbor_index)
+                if explored.insert(neighbor_index)
+                    && predicate(neighbor_index, &self.cells[neighbor_index], &self.user_state)
                 {
-                    explored.insert(neighbor_index);
                     stack.push(neighbor_index);
                 }
             } else {
@@ -319,13 +302,9 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Chunk<C, 
             // -y neighbor
             if y - 1 >= 0 {
                 let neighbor_index = LocalCellPosition::<S>::new(IVec3::new(x, y - 1, z)).index();
-                if predicate(
-                    neighbor_index,
-                    &self.cells[neighbor_index],
-                    &self.user_state,
-                ) && !explored.contains(neighbor_index)
+                if explored.insert(neighbor_index)
+                    && predicate(neighbor_index, &self.cells[neighbor_index], &self.user_state)
                 {
-                    explored.insert(neighbor_index);
                     stack.push(neighbor_index);
                 }
             } else {
@@ -336,13 +315,9 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Chunk<C, 
             // +z neighbor
             if z + 1 < side_len {
                 let neighbor_index = LocalCellPosition::<S>::new(IVec3::new(x, y, z + 1)).index();
-                if predicate(
-                    neighbor_index,
-                    &self.cells[neighbor_index],
-                    &self.user_state,
-                ) && !explored.contains(neighbor_index)
+                if explored.insert(neighbor_index)
+                    && predicate(neighbor_index, &self.cells[neighbor_index], &self.user_state)
                 {
-                    explored.insert(neighbor_index);
                     stack.push(neighbor_index);
                 }
             } else {
@@ -353,13 +328,9 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Chunk<C, 
             // -z neighbor
             if z - 1 >= 0 {
                 let neighbor_index = LocalCellPosition::<S>::new(IVec3::new(x, y, z - 1)).index();
-                if predicate(
-                    neighbor_index,
-                    &self.cells[neighbor_index],
-                    &self.user_state,
-                ) && !explored.contains(neighbor_index)
+                if explored.insert(neighbor_index)
+                    && predicate(neighbor_index, &self.cells[neighbor_index], &self.user_state)
                 {
-                    explored.insert(neighbor_index);
                     stack.push(neighbor_index);
                 }
             } else {
@@ -458,6 +429,22 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Chunk<C, 
             None
         }
     }
+
+    /// borrows self as an initialized chunk, if initialized
+    pub fn borrow_as_initialized(&mut self) -> Option<InitializedChunk<'_, C, S, T>> {
+        if self.is_init() {
+            Some(InitializedChunk(self))
+        } else {
+            None
+        }
+    }
+}
+
+impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> Drop for Chunk<C, S, T> {
+    fn drop(&mut self) {
+        // clear() already calls on_uninit when the chunk is initialized
+        self.clear();
+    }
 }
 
 /// the result of potentially out-of-bounds traversing over cells in a chunk first traversal over a chunk
@@ -504,12 +491,10 @@ pub type SegmentOverlapIter<S> = GridSegmentOverlapIter<'static, S>;
 
 impl<S: ChunkSize> AabbIndexIter<S> {
     pub fn new(mut start: LocalCellPosition<S>, mut end: LocalCellPosition<S>) -> Self {
-        start = start.entrywise_min(&LocalCellPosition::new(S::DIMENSIONS));
-        end = end.entrywise_min(&LocalCellPosition::new(
-            S::DIMENSIONS + IVec3::new(1, 1, 1).coords,
-        ));
+        *start = start.simd_max(IVec3::new(0, 0, 0));
+        *end = end.simd_min(S::DIMENSIONS);
         Self {
-            cell_iter: AabbCellIter::new(Aabb::new(start.0, end.0)),
+            cell_iter: AabbCellIter::new(Aabb::new(*start, *end)),
             marker: PhantomData,
         }
     }
@@ -546,21 +531,28 @@ impl<
     S: ChunkSize,
     T: ChunkState<C, S>,
     I: Iterator<Item = usize>,
+> ChunkIterMut<'a, C, S, T, I>
+{
+    pub fn user_state(&mut self) -> &mut T {
+        self.user_state
+    }
+}
+
+impl<
+    'a,
+    C: Copy + Default + PartialEq,
+    S: ChunkSize,
+    T: ChunkState<C, S>,
+    I: Iterator<Item = usize>,
 > Iterator for ChunkIterMut<'a, C, S, T, I>
 {
-    type Item = (usize, &'a mut C, &'a mut T);
+    type Item = (usize, &'a mut C);
 
     fn next(&mut self) -> Option<Self::Item> {
         let index = self.index_iter.next()?;
         let cell_ptr = std::ptr::from_mut(&mut self.cells[index]);
-        let state_ptr = std::ptr::from_mut(&mut self.user_state);
-        Some(unsafe {
-            (
-                index,
-                cell_ptr.as_mut_unchecked(),
-                state_ptr.as_mut_unchecked(),
-            )
-        })
+        // SAFETY: index iterators used here never yield the same index twice
+        Some((index, unsafe { &mut *cell_ptr }))
     }
 }
 
@@ -579,6 +571,65 @@ impl<'a, C: Copy + Default + PartialEq, S: ChunkSize, I: Iterator<Item = usize>>
 
     fn next(&mut self) -> Option<Self::Item> {
         let index = self.index_iter.next()?;
-        Some((index, unsafe { *self.cells.get_unchecked(index) }))
+        Some((index, self.cells[index]))
+    }
+}
+
+/// an initialized chunk that cannot be cleared
+pub struct InitializedChunk<'a, C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>>(
+    &'a mut Chunk<C, S, T>,
+);
+
+impl<'a, C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>>
+    InitializedChunk<'a, C, S, T>
+{
+    pub const LENGTH_POWER_OF_2: usize = S::POWER_OF_TWO;
+    pub const SIDE_LENGTH: usize = S::SIDE_LENGTH;
+    pub const SIZE: usize = S::SIZE;
+    pub const DIMENSIONS: IVec3 = S::DIMENSIONS;
+
+    delegate! {
+        to self.0 {
+
+            pub fn get_cell(&self, index: usize) -> C;
+
+            pub fn get_cell_mut<U>(
+                &mut self,
+                index: usize,
+                mutator: impl FnOnce(usize, &mut C, &mut T) -> U,
+            ) -> U;
+
+            pub fn depth_first_traversal(
+                &mut self,
+                start_cells: impl Iterator<Item = usize>,
+                predicate: impl FnMut(usize, &C, &T) -> bool,
+                mutator: impl FnMut(usize, &mut C, &mut T),
+            ) -> ChunkBoundaryTraversalResult<S>;
+
+            pub fn iter(&self) -> Option<ChunkIter<'_, C, S, AabbIndexIter<S>>>;
+
+            pub fn iter_bounded(
+                &self,
+                min: LocalCellPosition<S>,
+                max: LocalCellPosition<S>,
+            ) -> Option<ChunkIter<'_, C, S, AabbIndexIter<S>>>;
+
+            pub fn iter_mut(&mut self) -> Option<ChunkIterMut<'_, C, S, T, AabbIndexIter<S>>>;
+            pub fn iter_mut_bounded(
+                &mut self,
+                min: LocalCellPosition<S>,
+                max: LocalCellPosition<S>,
+            ) -> Option<ChunkIterMut<'_, C, S, T, AabbIndexIter<S>>>;
+
+            pub fn iter_segment_overlap(
+                &self,
+                segment: LineSegment,
+            ) -> Option<ChunkIter<'_, C, S, SegmentOverlapIter<S>>>;
+
+            pub fn iter_mut_segment_overlap(
+                &mut self,
+                segment: LineSegment,
+            ) -> Option<ChunkIterMut<'_, C, S, T, SegmentOverlapIter<S>>>;
+        }
     }
 }

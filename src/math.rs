@@ -24,6 +24,14 @@ pub trait GridExt<'a>: Grid<'a> {
     }
 }
 
+pub fn floor_fvec3(fvec3: &FVec3) -> IVec3 {
+    IVec3::new(
+        fvec3.x.floor() as isize,
+        fvec3.y.floor() as isize,
+        fvec3.z.floor() as isize,
+    )
+}
+
 impl<'a, G: Grid<'a>> GridExt<'a> for G {}
 
 #[derive(Debug, Clone, Copy)]
@@ -39,22 +47,6 @@ impl<V> Aabb<V> {
 }
 
 impl Aabb<IVec3> {
-    /// creates a conservative *end-exclusive* Aabb from a continuous aaabb (Aabb<FVec3>)
-    pub fn from_continuous(continuous_aabb: &Aabb<FVec3>) -> Self {
-        Self {
-            min: IVec3::new(
-                continuous_aabb.min.x.floor() as isize,
-                continuous_aabb.min.y.floor() as isize,
-                continuous_aabb.min.z.floor() as isize,
-            ),
-            max: IVec3::new(
-                continuous_aabb.max.x.ceil() as isize + 1,
-                continuous_aabb.max.y.ceil() as isize + 1,
-                continuous_aabb.max.z.ceil() as isize + 1,
-            ),
-        }
-    }
-
     /// gets the *end-exclusive* aabb of the intersection of two *end-exclusive* aabbs
     pub fn intersection(&self, other: &Self) -> Self {
         Self {
@@ -231,6 +223,7 @@ pub fn segment_aabb_intersection(aabb: &Aabb<FVec3>, seg: &LineSegment) -> Optio
 
 pub struct GridSegmentOverlapIter<'a, G: Grid<'a>> {
     grid: G,
+    aabb: Aabb<IVec3>,
 
     pos: IVec3,
     step: IVec3,
@@ -243,8 +236,26 @@ pub struct GridSegmentOverlapIter<'a, G: Grid<'a>> {
 }
 
 impl<'a, G: Grid<'a>> GridSegmentOverlapIter<'a, G> {
+    /// an iterator that yields nothing
+    fn finished(grid: G, aabb: Aabb<IVec3>) -> Self {
+        Self {
+            grid,
+            aabb,
+            pos: IVec3::origin(),
+            step: IVec3::origin(),
+            t_max: FVec3::origin(),
+            t_delta: FVec3::origin(),
+            bounds: IVec3::origin(),
+            done: true,
+            marker: PhantomData,
+        }
+    }
+
     pub fn new(grid: G, ray: LineSegment) -> Self {
         let aabb = grid.aabb();
+        if aabb.is_empty() {
+            return Self::finished(grid, aabb);
+        }
         let faabb = Aabb {
             min: aabb.min.cast(),
             max: aabb.max.cast(),
@@ -252,19 +263,7 @@ impl<'a, G: Grid<'a>> GridSegmentOverlapIter<'a, G> {
 
         let clipped = match segment_aabb_intersection(&faabb, &ray) {
             Some(segment) => segment,
-            None => {
-                return Self {
-                    grid,
-                    pos: IVec3::origin(),
-                    step: IVec3::origin(),
-                    t_max: FVec3::origin(),
-                    t_delta: FVec3::origin(),
-                    bounds: IVec3::origin(),
-                    done: true,
-
-                    marker: PhantomData,
-                };
-            }
+            None => return Self::finished(grid, aabb),
         };
 
         let start = clipped.start;
@@ -328,6 +327,8 @@ impl<'a, G: Grid<'a>> GridSegmentOverlapIter<'a, G> {
 
         Self {
             grid,
+
+            aabb,
             pos,
             step,
             t_max,
@@ -361,6 +362,11 @@ impl<'a, G: Grid<'a>> Iterator for GridSegmentOverlapIter<'a, G> {
             return Some(cell);
         }
 
+        if self.t_max.x.min(self.t_max.y).min(self.t_max.z) > 1.0 {
+            self.done = true;
+            return Some(cell);
+        }
+
         // Step along the axis with the minimum t_max
         if self.t_max.x < self.t_max.y && self.t_max.x < self.t_max.z {
             self.pos.x += self.step.x;
@@ -374,13 +380,12 @@ impl<'a, G: Grid<'a>> Iterator for GridSegmentOverlapIter<'a, G> {
         }
 
         // Correct boundary check against grid min/max bounds (supports non-zero origin grids)
-        let grid_aabb = self.grid.aabb();
-        if self.pos.x < grid_aabb.min.x
-            || self.pos.x >= grid_aabb.max.x
-            || self.pos.y < grid_aabb.min.y
-            || self.pos.y >= grid_aabb.max.y
-            || self.pos.z < grid_aabb.min.z
-            || self.pos.z >= grid_aabb.max.z
+        if self.pos.x < self.aabb.min.x
+            || self.pos.x >= self.aabb.max.x
+            || self.pos.y < self.aabb.min.y
+            || self.pos.y >= self.aabb.max.y
+            || self.pos.z < self.aabb.min.z
+            || self.pos.z >= self.aabb.max.z
         {
             self.done = true;
         }
