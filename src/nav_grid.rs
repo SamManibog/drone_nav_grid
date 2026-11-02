@@ -21,7 +21,8 @@ pub enum ExplOccCell {
     #[default]
     Unexplored,
     EmptyExplored,
-    Occupied,
+    SafetyOccupied,
+    Obstacle,
 }
 
 impl ExplOccCell {
@@ -30,17 +31,22 @@ impl ExplOccCell {
     }
 
     pub fn is_occupied(&self) -> bool {
-        *self == Self::Occupied
+        *self == Self::SafetyOccupied || *self == Self::Obstacle
+    }
+
+    pub const fn into_i32(&self) -> i32 {
+        match self {
+            Self::Unexplored => -1,
+            Self::EmptyExplored => 0,
+            Self::SafetyOccupied => 1,
+            Self::Obstacle => 2,
+        }
     }
 }
 
 impl Into<i32> for ExplOccCell {
     fn into(self) -> i32 {
-        match self {
-            Self::Unexplored => -1,
-            Self::EmptyExplored => 0,
-            Self::Occupied => 1,
-        }
+        self.into_i32()
     }
 }
 
@@ -295,7 +301,7 @@ impl OccupiedExploredNavGrid {
                     end: beam_end,
                 },
                 |_, cell, _| {
-                    if *cell != ExplOccCell::Occupied {
+                    if !cell.is_occupied() {
                         *cell = ExplOccCell::EmptyExplored;
                     }
                     true
@@ -325,7 +331,21 @@ impl OccupiedExploredNavGrid {
         let mut output = Vec::new();
 
         for hit in hit_cells {
-            output.push(self.inv_transform_point(hit.center()));
+            let is_obstacle = self
+                .voxels
+                .get_cell_mut(self.voxels.get_cell_id(hit).unwrap(), |_, c, _| {
+                    if *c != ExplOccCell::Obstacle {
+                        *c = ExplOccCell::Obstacle;
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap();
+
+            if is_obstacle {
+                output.push(self.inv_transform_point(hit.center()));
+            }
 
             let region = Aabb::new(
                 IVec3::new(hit.x - radius, hit.y - radius, hit.z - radius),
@@ -335,7 +355,9 @@ impl OccupiedExploredNavGrid {
             self.voxels
                 .aabb_cell_initializing_for_each_mut(region, |pos, cell, _| {
                     if ivec3_dist_sq(&pos, &hit) as f32 <= margin_sq {
-                        *cell = ExplOccCell::Occupied;
+                        if !cell.is_occupied() {
+                            *cell = ExplOccCell::SafetyOccupied
+                        }
                     }
                 });
         }
