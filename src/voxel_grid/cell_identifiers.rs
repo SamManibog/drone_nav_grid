@@ -158,6 +158,14 @@ impl CellPosition {
             self.0.z.rem_euclid(S::SIDE_LENGTH as isize),
         ))
     }
+
+    pub fn center(self) -> FVec3 {
+        FVec3::new(
+            self.x as f32 + 0.5,
+            self.y as f32 + 0.5,
+            self.z as f32 + 0.5,
+        )
+    }
 }
 
 #[repr(transparent)]

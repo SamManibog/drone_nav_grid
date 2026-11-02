@@ -248,10 +248,12 @@ impl OccupiedExploredNavGrid {
     /// handle lidar scan
     ///
     ///  - start - world position of the scanner
-    ///  - endpoints - world positions of the points hit (or max-range points) of each beam
+    ///  - endpoints - *relative* world positions of the points hit (or max-range points) of each beam
     ///  - range - maximum sensor range, in world units. Beams ending further away are truncated
     ///    and do NOT produce obstacles
     ///  - safety_margin - world-space radius around each in-range hit that is marked occupied
+    ///
+    /// returns a list of centerpoints of newly-detected obstacles (not the same as occupied cells)
     ///
     /// Cells along every beam become explored-empty (unless already occupied). Afterwards every
     /// cell whose center lies within `safety_margin` of an in-range hit cell's center is occupied.
@@ -261,7 +263,7 @@ impl OccupiedExploredNavGrid {
         endpoints: impl Iterator<Item = FVec3>,
         range: f32,
         safety_margin: f32,
-    ) {
+    ) -> Vec<FVec3> {
         // map start, range, safety_margin to voxel coords (1 unit == 1 cell)
         let start_v = self.transform_point(start);
         let range_v = range / self.unit_size;
@@ -272,7 +274,7 @@ impl OccupiedExploredNavGrid {
         let mut hit_cells: HashSet<CellPosition> = HashSet::new();
 
         for endpoint in endpoints {
-            let end_v = self.transform_point(endpoint);
+            let end_v = self.transform_point(start + endpoint.coords);
             let delta = end_v - start_v;
             let len = delta.norm();
             if !len.is_finite() {
@@ -320,7 +322,11 @@ impl OccupiedExploredNavGrid {
         let radius = margin_v.ceil() as isize;
         let margin_sq = margin_v * margin_v;
 
+        let mut output = Vec::new();
+
         for hit in hit_cells {
+            output.push(self.inv_transform_point(hit.center()));
+
             let region = Aabb::new(
                 IVec3::new(hit.x - radius, hit.y - radius, hit.z - radius),
                 IVec3::new(hit.x + radius + 1, hit.y + radius + 1, hit.z + radius + 1),
@@ -333,9 +339,9 @@ impl OccupiedExploredNavGrid {
                     }
                 });
         }
-    }
 
-    ///
+        output
+    }
 
     /// generate a a path using funnelled astar algorithm to get as near as possible to the given point
     /// attempts to get as near as possible to the end point within the given search size

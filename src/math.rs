@@ -52,6 +52,7 @@ impl<V> Aabb<V> {
     pub fn new(min: V, max: V) -> Self {
         Self { min, max }
     }
+
 }
 
 impl Aabb<IVec3> {
@@ -89,6 +90,11 @@ impl Aabb<FVec3> {
 
     pub fn segment_intersection(&self, segment: &LineSegment) -> Option<LineSegment> {
         segment_aabb_intersection(self, segment)
+    }
+
+    /// checks if the Aabb is empty, assumining end-exclusive bounds
+    pub fn is_empty(&self) -> bool {
+        return self.min.x >= self.max.x || self.min.y >= self.max.y || self.min.z >= self.max.z;
     }
 }
 

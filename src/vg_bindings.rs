@@ -1,6 +1,6 @@
 #[pyo3::pymodule(name = "drone_nav_grid")]
 pub mod drone_nav_grid {
-    use pyo3::prelude::*;
+    use pyo3::{exceptions::PyException, prelude::*};
 
     use std::{path::PathBuf, str::FromStr};
 
@@ -45,6 +45,7 @@ pub mod drone_nav_grid {
         #[classattr]
         const EMPTY_UNEXPLORED: i32 = -1;
 
+        /// constructs a new navigation grid using the given aabb
         #[new]
         fn __new__(
             min: &Bound<'_, PyAny>,
@@ -53,6 +54,13 @@ pub mod drone_nav_grid {
         ) -> PyResult<Self> {
             let min = py_parse_fvec3(min)?;
             let max = py_parse_fvec3(max)?;
+
+            if Aabb::<FVec3>::new(min, max).is_empty() {
+                return PyResult::Err(PyErr::new::<PyException, _>("min must be less than max."));
+            }
+            if unit_size <= 0.0 || !unit_size.is_finite() {
+                return PyResult::Err(PyErr::new::<PyException, _>("unit_size must be positive and finite."));
+            }
 
             Ok(Self {
                 inner: OccupiedExploredNavGrid::new(Aabb::new(min, max), unit_size),
@@ -102,7 +110,7 @@ pub mod drone_nav_grid {
             endpoints: &Bound<'_, PyAny>,
             range: f32,
             safety_margin: f32,
-        ) -> PyResult<()> {
+        ) -> PyResult<Vec<Vec<f32>>> {
             let start = py_parse_fvec3(start)?;
 
             let mut ep_vec: Vec<FVec3> = Vec::new();
@@ -111,9 +119,12 @@ pub mod drone_nav_grid {
                 ep_vec.push(py_parse_fvec3(&point)?);
             }
 
-            self.inner
-                .handle_scan(start, ep_vec.into_iter(), range, safety_margin);
-            Ok(())
+            Ok(self
+                .inner
+                .handle_scan(start, ep_vec.into_iter(), range, safety_margin)
+                .into_iter()
+                .map(py_emit_fvec3)
+                .collect())
         }
 
         pub fn pathfind(
