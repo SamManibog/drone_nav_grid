@@ -90,7 +90,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "drone_nav"
+name = "drone_nav_grid"
 version = "0.1.0"
 dependencies = [
  "bit-set",

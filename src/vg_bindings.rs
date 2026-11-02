@@ -1,145 +1,150 @@
-use std::{path::PathBuf, str::FromStr};
+#[pyo3::pymodule(name = "drone_nav_grid")]
+pub mod drone_nav_grid {
+    use pyo3::prelude::*;
 
-use pyo3::prelude::*;
+    use std::{path::PathBuf, str::FromStr};
 
-use crate::{
-    math::{Aabb, FVec3, IVec3},
-    nav_grid::OccupiedExploredNavGrid,
-};
+    use crate::{
+        math::{Aabb, FVec3, IVec3},
+        nav_grid::OccupiedExploredNavGrid,
+    };
 
-#[pyclass(name = "NavGrid")]
-pub struct PyNavGrid {
-    inner: OccupiedExploredNavGrid,
-}
-
-fn py_parse_fvec3(py_any: &Bound<'_, PyAny>) -> PyResult<FVec3> {
-    Ok(FVec3::new(
-        py_any.get_item(0)?.extract::<f32>()?,
-        py_any.get_item(1)?.extract::<f32>()?,
-        py_any.get_item(2)?.extract::<f32>()?,
-    ))
-}
-
-fn py_emit_fvec3(v: FVec3) -> Vec<f32> {
-    vec![v.x, v.y, v.z]
-}
-
-fn py_emit_ivec3(v: IVec3) -> Vec<isize> {
-    vec![v.x, v.y, v.z]
-}
-
-fn py_emit_faabb(aabb: Aabb<FVec3>) -> (Vec<f32>, Vec<f32>) {
-    (py_emit_fvec3(aabb.min), py_emit_fvec3(aabb.max))
-}
-
-#[pymethods]
-impl PyNavGrid {
-    #[classattr]
-    const OCCUPIED: i32 = 1;
-
-    #[classattr]
-    const EMPTY_EXPLORED: i32 = 0;
-
-    #[classattr]
-    const EMPTY_UNEXPLORED: i32 = -1;
-
-    #[new]
-    fn __new__(min: &Bound<'_, PyAny>, max: &Bound<'_, PyAny>, unit_size: f32) -> PyResult<Self> {
-        let min = py_parse_fvec3(min)?;
-        let max = py_parse_fvec3(max)?;
-
-        Ok(Self {
-            inner: OccupiedExploredNavGrid::new(Aabb::new(min, max), unit_size),
-        })
+    #[pyclass(name = "NavGrid")]
+    pub struct PyNavGrid {
+        inner: OccupiedExploredNavGrid,
     }
 
-    pub fn unit_size(&self) -> f32 {
-        self.inner.unit_size()
+    fn py_parse_fvec3(py_any: &Bound<'_, PyAny>) -> PyResult<FVec3> {
+        Ok(FVec3::new(
+            py_any.get_item(0)?.extract::<f32>()?,
+            py_any.get_item(1)?.extract::<f32>()?,
+            py_any.get_item(2)?.extract::<f32>()?,
+        ))
     }
 
-    pub fn dimensions(&self) -> Vec<f32> {
-        py_emit_fvec3(self.inner.dimensions())
+    fn py_emit_fvec3(v: FVec3) -> Vec<f32> {
+        vec![v.x, v.y, v.z]
     }
 
-    pub fn cell_dimensions(&self) -> Vec<isize> {
-        py_emit_ivec3(self.inner.cell_dimensions())
+    fn py_emit_ivec3(v: IVec3) -> Vec<isize> {
+        vec![v.x, v.y, v.z]
     }
 
-    pub fn aabb(&self) -> (Vec<f32>, Vec<f32>) {
-        py_emit_faabb(self.inner.aabb())
+    fn py_emit_faabb(aabb: Aabb<FVec3>) -> (Vec<f32>, Vec<f32>) {
+        (py_emit_fvec3(aabb.min), py_emit_fvec3(aabb.max))
     }
 
-    pub fn is_in_bounds(&self, point: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let p = py_parse_fvec3(point)?;
-        Ok(self.inner.is_in_bounds(p))
-    }
+    #[pymethods]
+    impl PyNavGrid {
+        #[classattr]
+        const OCCUPIED: i32 = 1;
 
-    pub fn cell_at(&self, position: &Bound<'_, PyAny>) -> PyResult<i32> {
-        let p = py_parse_fvec3(position)?;
-        let cell = self.inner.cell_at(p);
+        #[classattr]
+        const EMPTY_EXPLORED: i32 = 0;
 
-        Ok(cell.into())
-    }
+        #[classattr]
+        const EMPTY_UNEXPLORED: i32 = -1;
 
-    pub fn nearest_safe_position(&self, position: &Bound<'_, PyAny>) -> PyResult<Option<Vec<f32>>> {
-        let pos = py_parse_fvec3(position)?;
+        #[new]
+        fn __new__(
+            min: &Bound<'_, PyAny>,
+            max: &Bound<'_, PyAny>,
+            unit_size: f32,
+        ) -> PyResult<Self> {
+            let min = py_parse_fvec3(min)?;
+            let max = py_parse_fvec3(max)?;
 
-        Ok(self.inner.nearest_safe_position(pos).map(py_emit_fvec3))
-    }
-
-    pub fn handle_scan(
-        &mut self,
-        start: &Bound<'_, PyAny>,
-        endpoints: &Bound<'_, PyAny>,
-        range: f32,
-        safety_margin: f32,
-    ) -> PyResult<()> {
-        let start = py_parse_fvec3(start)?;
-
-        let mut ep_vec: Vec<FVec3> = Vec::new();
-        for ep in endpoints.try_iter()? {
-            let point = ep?;
-            ep_vec.push(py_parse_fvec3(&point)?);
+            Ok(Self {
+                inner: OccupiedExploredNavGrid::new(Aabb::new(min, max), unit_size),
+            })
         }
 
-        self.inner.handle_scan(start, ep_vec.into_iter(), range, safety_margin);
-        Ok(())
+        pub fn unit_size(&self) -> f32 {
+            self.inner.unit_size()
+        }
+
+        pub fn dimensions(&self) -> Vec<f32> {
+            py_emit_fvec3(self.inner.dimensions())
+        }
+
+        pub fn cell_dimensions(&self) -> Vec<isize> {
+            py_emit_ivec3(self.inner.cell_dimensions())
+        }
+
+        pub fn aabb(&self) -> (Vec<f32>, Vec<f32>) {
+            py_emit_faabb(self.inner.aabb())
+        }
+
+        pub fn is_in_bounds(&self, point: &Bound<'_, PyAny>) -> PyResult<bool> {
+            let p = py_parse_fvec3(point)?;
+            Ok(self.inner.is_in_bounds(p))
+        }
+
+        pub fn cell_at(&self, position: &Bound<'_, PyAny>) -> PyResult<i32> {
+            let p = py_parse_fvec3(position)?;
+            let cell = self.inner.cell_at(p);
+
+            Ok(cell.into())
+        }
+
+        pub fn nearest_safe_position(
+            &self,
+            position: &Bound<'_, PyAny>,
+        ) -> PyResult<Option<Vec<f32>>> {
+            let pos = py_parse_fvec3(position)?;
+
+            Ok(self.inner.nearest_safe_position(pos).map(py_emit_fvec3))
+        }
+
+        pub fn handle_scan(
+            &mut self,
+            start: &Bound<'_, PyAny>,
+            endpoints: &Bound<'_, PyAny>,
+            range: f32,
+            safety_margin: f32,
+        ) -> PyResult<()> {
+            let start = py_parse_fvec3(start)?;
+
+            let mut ep_vec: Vec<FVec3> = Vec::new();
+            for ep in endpoints.try_iter()? {
+                let point = ep?;
+                ep_vec.push(py_parse_fvec3(&point)?);
+            }
+
+            self.inner
+                .handle_scan(start, ep_vec.into_iter(), range, safety_margin);
+            Ok(())
+        }
+
+        pub fn pathfind(
+            &self,
+            start: &Bound<'_, PyAny>,
+            end: &Bound<'_, PyAny>,
+            search_size: usize,
+        ) -> PyResult<Vec<Vec<f32>>> {
+            let start = py_parse_fvec3(start)?;
+            let end = py_parse_fvec3(end)?;
+
+            Ok(self
+                .inner
+                .pathfind(start, end, search_size)
+                .into_iter()
+                .map(|p| py_emit_fvec3(p))
+                .collect())
+        }
+
+        pub fn find_floor(&self, x: f32, z: f32) -> Option<Vec<f32>> {
+            self.inner.find_floor(x, z).map(py_emit_fvec3)
+        }
+
+        pub fn export_occupied_obj(&self, path: &str) -> PyResult<()> {
+            self.inner.export_occupied_obj(PathBuf::from_str(path)?)?;
+            Ok(())
+        }
+
+        pub fn export_explored_obj(&self, path: &str) -> PyResult<()> {
+            self.inner.export_explored_obj(PathBuf::from_str(path)?)?;
+            Ok(())
+        }
     }
-
-    pub fn pathfind(
-        &self,
-        start: &Bound<'_, PyAny>,
-        end: &Bound<'_, PyAny>,
-        search_size: usize,
-    ) -> PyResult<Vec<Vec<f32>>> {
-        let start = py_parse_fvec3(start)?;
-        let end = py_parse_fvec3(end)?;
-
-        Ok(self
-            .inner
-            .pathfind(start, end, search_size)
-            .into_iter()
-            .map(|p| py_emit_fvec3(p))
-            .collect())
-    }
-
-    pub fn find_floor(&self, x: f32, z: f32) -> Option<Vec<f32>> {
-        self.inner.find_floor(x, z).map(py_emit_fvec3)
-    }
-
-    pub fn export_occupied_obj(&self, path: &str) -> PyResult<()> {
-        self.inner.export_occupied_obj(PathBuf::from_str(path)?)?;
-        Ok(())
-    }
-
-    pub fn export_explored_obj(&self, path: &str) -> PyResult<()> {
-        self.inner.export_explored_obj(PathBuf::from_str(path)?)?;
-        Ok(())
-    }
-}
-
-#[pymodule(name = "nav_grid")]
-fn nav_grid(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyNavGrid>()?;
-    Ok(())
 }
