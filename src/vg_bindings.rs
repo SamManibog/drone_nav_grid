@@ -1,4 +1,6 @@
-use pyo3::{prelude::*, types::PyString};
+use std::path::PathBuf;
+
+use pyo3::prelude::*;
 
 use crate::{
     math::{Aabb, FVec3, IVec3},
@@ -62,10 +64,12 @@ impl PyNavGrid {
         py_emit_fvec3(self.inner.dimensions())
     }
 
+    #[pyo3(signature = ())]
     pub fn cell_dimensions(&self) -> Vec<isize> {
         py_emit_ivec3(self.inner.cell_dimensions())
     }
 
+    #[pyo3(signature = ())]
     pub fn aabb(&self) -> (Vec<f32>, Vec<f32>) {
         py_emit_faabb(self.inner.aabb())
     }
@@ -149,20 +153,20 @@ impl PyNavGrid {
     }
 
     #[pyo3(signature = (path))]
-    pub fn export_occupied_obj(&self, path: &Bound<'_, PyString>) -> PyResult<()> {
-        self.inner.export_occupied_obj(path.to_str()?)?;
+    pub fn export_occupied_obj(&self, path: PathBuf) -> PyResult<()> {
+        self.inner.export_occupied_obj(path)?;
         Ok(())
     }
 
     #[pyo3(signature = (path))]
-    pub fn export_explored_obj(&self, path: &Bound<'_, PyString>) -> PyResult<()> {
-        self.inner.export_explored_obj(path.to_str()?)?;
+    pub fn export_explored_obj(&self, path: PathBuf) -> PyResult<()> {
+        self.inner.export_explored_obj(path)?;
         Ok(())
     }
 }
 
-#[pymodule]
-fn drone_nav_system(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pymodule(name = "nav_grid")]
+fn nav_grid(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNavGrid>()?;
     Ok(())
 }
