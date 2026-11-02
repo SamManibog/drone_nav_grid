@@ -16,9 +16,11 @@ Once prerequisites have been installed, you may then install this extension modu
 First, clone the repository.
 `git clone https://github.com/SamManibog/drone_nav_grid --depth 1`
 
-Second, run the built in python installation script.
-`cd drone_nav_grid
-python install.py`
+Second, run the built-in python installation script.
+```
+cd drone_nav_grid
+python install.py
+```
 
 ## Usage
 
