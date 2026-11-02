@@ -3,9 +3,7 @@ use std::{collections::HashSet, io, path::Path};
 use nalgebra::SimdPartialOrd;
 
 use crate::{
-    math::{
-        Aabb, FVec3, IManhattanDistance, IVec3, LineSegment, floor_fvec3, ivec3_dist_sq
-    },
+    math::{Aabb, FVec3, IManhattanDistance, IVec3, LineSegment, floor_fvec3, ivec3_dist_sq},
     voxel_grid::{
         cell_identifiers::{CellID, CellPosition},
         chunks::ChunkSize64,
@@ -21,18 +19,28 @@ use crate::{
 #[repr(u8)]
 pub enum ExplOccCell {
     #[default]
-    EmptyUnexplored,
+    Unexplored,
     EmptyExplored,
     Occupied,
 }
 
 impl ExplOccCell {
     pub fn is_explored(&self) -> bool {
-        *self != Self::EmptyUnexplored
+        *self != Self::Unexplored
     }
 
     pub fn is_occupied(&self) -> bool {
         *self == Self::Occupied
+    }
+}
+
+impl Into<i32> for ExplOccCell {
+    fn into(self) -> i32 {
+        match self {
+            Self::Unexplored => -1,
+            Self::EmptyExplored => 0,
+            Self::Occupied => 1,
+        }
     }
 }
 
@@ -45,6 +53,7 @@ type NavCellID = CellID<ChunkSize64>;
 ///    - if pathing fails, another point is chosen
 ///    - if pathing succeeds, that point is removed from the set
 ///  - if pathing fails for all points in set, the region is considered fully explored
+#[derive(Debug, Clone)]
 pub struct OccupiedExploredNavGrid {
     /// world position of the min corner of cell (0, 0, 0)
     offset: FVec3,
@@ -207,7 +216,7 @@ impl OccupiedExploredNavGrid {
     }
 
     /// locate center point of the nearest explored empty cell
-    pub fn nearest_safe_cell(&self, position: FVec3) -> Option<FVec3> {
+    pub fn nearest_safe_position(&self, position: FVec3) -> Option<FVec3> {
         let cell_position = self.cell_position_from_world_point(position);
 
         let bfs_iter = self
@@ -287,6 +296,7 @@ impl OccupiedExploredNavGrid {
                     if *cell != ExplOccCell::Occupied {
                         *cell = ExplOccCell::EmptyExplored;
                     }
+                    true
                 },
             );
 
@@ -361,6 +371,49 @@ impl OccupiedExploredNavGrid {
             .into_iter()
             .map(|p| self.world_point_from_cell_center(self.voxels.get_cell_position(p).unwrap()))
             .collect()
+    }
+
+    /// attempts to get the y position of the floor at the given x, z coordinate
+    pub fn find_floor(&self, x: f32, z: f32) -> Option<FVec3> {
+        if x < self.offset.x
+            || z < self.offset.z
+            || x >= self.offset.x + self.dimensions.x
+            || z >= self.offset.z + self.dimensions.z
+        {
+            return None;
+        }
+
+        let (test_min, test_max) = {
+            let max = self.transform_point(FVec3::new(x, self.offset.y + self.dimensions.y, z));
+            (FVec3::new(max.x, 0.0, max.z), max)
+        };
+
+        let mut last_occupied = None;
+
+        self.voxels.segment_cell_skipping_for_each(
+            LineSegment {
+                start: test_min,
+                end: test_max,
+            },
+            |id, cell_state, _| {
+                if cell_state.is_occupied() {
+                    last_occupied = Some(id);
+                } else if last_occupied.is_some() {
+                    return false;
+                }
+                true
+            },
+        );
+        let floor_cell = last_occupied?;
+
+        let floor_cell_pos = self.voxels.get_cell_position(floor_cell).unwrap();
+        let floor_cell_pos = FVec3::new(
+            floor_cell_pos.x as f32,
+            floor_cell_pos.y as f32,
+            floor_cell_pos.z as f32,
+        ) + FVec3::new(0.5, 1.0, 0.5).coords;
+
+        Some(self.inv_transform_point(floor_cell_pos))
     }
 
     /// writes a Wavefront .obj mesh of every occupied cell

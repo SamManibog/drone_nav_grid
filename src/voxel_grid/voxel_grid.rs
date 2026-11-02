@@ -9,8 +9,8 @@ use nalgebra::SimdPartialOrd;
 
 use crate::{
     math::{
-        Aabb, AabbCellIter, FVec3, Grid, GridExt, GridSegmentOverlapIter, IDistanceHeuristic, IVec3,
-        LineSegment,
+        Aabb, AabbCellIter, FVec3, Grid, GridExt, GridSegmentOverlapIter, IDistanceHeuristic,
+        IVec3, LineSegment,
     },
     voxel_grid::{
         cell_identifiers::{CellID, CellPosition, ChunkID, ChunkPosition, LocalCellPosition},
@@ -515,8 +515,16 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
         // side length is a power of two, so this scaling is exact
         let inv = 1.0 / S::SIDE_LENGTH as f32;
         LineSegment {
-            start: FVec3::new(segment.start.x * inv, segment.start.y * inv, segment.start.z * inv),
-            end: FVec3::new(segment.end.x * inv, segment.end.y * inv, segment.end.z * inv),
+            start: FVec3::new(
+                segment.start.x * inv,
+                segment.start.y * inv,
+                segment.start.z * inv,
+            ),
+            end: FVec3::new(
+                segment.end.x * inv,
+                segment.end.y * inv,
+                segment.end.z * inv,
+            ),
         }
     }
 
@@ -605,34 +613,60 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
     /// initializes any uninitialized chunks on the way.
     /// line segment is in cell coordinates
     ///
+    /// visit should return true if iteration should continue and false if iteration should end
+    ///
     /// This is internal iteration rather than an `Iterator` on purpose: yielding `&mut T` (the
     /// chunk state) for every cell of a chunk from an `Iterator` would hand out aliasing `&mut`s.
     pub fn segment_cell_initializing_for_each_mut(
         &mut self,
         segment: LineSegment,
-        mut visit: impl FnMut(CellID<S>, &mut C, &mut T),
+        mut visit: impl FnMut(CellID<S>, &mut C, &mut T) -> bool,
     ) {
         // the id iterator owns copies of the dimensions, so it does not borrow self
         for id in self.segment_cell_id_iter(segment) {
             self.get_chunk_mut(id.chunk_id(), |chunk| {
                 chunk.init();
-                chunk.get_cell_mut(id.local_index(), |_, cell, state| visit(id, cell, state));
+                if !chunk.get_cell_mut(id.local_index(), |_, cell, state| visit(id, cell, state)) {
+                    return;
+                }
             });
         }
     }
 
     /// like `segment_cell_initializing_for_each_mut`, but cells in uninitialized chunks are skipped
+    /// visit should return true if iteration should continue and false if iteration should end
+    pub fn segment_cell_skipping_for_each(
+        &self,
+        segment: LineSegment,
+        mut visit: impl FnMut(CellID<S>, C, &T) -> bool,
+    ) {
+        for id in self.segment_cell_id_iter(segment) {
+            if !self.is_chunk_init(id.chunk_id()) {
+                continue;
+            }
+            let chunk = self.get_chunk(id.chunk_id()).unwrap();
+            let cell = chunk.get_cell(id.local_index());
+            if !visit(id, cell, &chunk.user_state) {
+                return;
+            }
+        }
+    }
+
+    /// like `segment_cell_initializing_for_each_mut`, but cells in uninitialized chunks are skipped
+    /// visit should return true if iteration should continue and false if iteration should end
     pub fn segment_cell_skipping_for_each_mut(
         &mut self,
         segment: LineSegment,
-        mut visit: impl FnMut(CellID<S>, &mut C, &mut T),
+        mut visit: impl FnMut(CellID<S>, &mut C, &mut T) -> bool,
     ) {
         for id in self.segment_cell_id_iter(segment) {
             if !self.is_chunk_init(id.chunk_id()) {
                 continue;
             }
             self.get_chunk_mut(id.chunk_id(), |chunk| {
-                chunk.get_cell_mut(id.local_index(), |_, cell, state| visit(id, cell, state));
+                if !chunk.get_cell_mut(id.local_index(), |_, cell, state| visit(id, cell, state)) {
+                    return;
+                }
             });
         }
     }
@@ -776,9 +810,10 @@ impl<
             id = self.id_iter.next()?;
         }
         let chunk_ptr = std::ptr::from_mut(&mut self.grid.chunks[id.index()]);
-        Some((id, unsafe { &mut *chunk_ptr }
-            .borrow_as_initialized()
-            .unwrap()))
+        Some((
+            id,
+            unsafe { &mut *chunk_ptr }.borrow_as_initialized().unwrap(),
+        ))
     }
 }
 
@@ -811,9 +846,10 @@ impl<
         self.grid.chunks[id.index()].init();
         self.grid.initialized_chunks.insert(id.index());
         let chunk_ptr = std::ptr::from_mut(&mut self.grid.chunks[id.index()]);
-        Some((ChunkID::new(id.index()), unsafe { &mut *chunk_ptr }
-            .borrow_as_initialized()
-            .unwrap()))
+        Some((
+            ChunkID::new(id.index()),
+            unsafe { &mut *chunk_ptr }.borrow_as_initialized().unwrap(),
+        ))
     }
 }
 
@@ -830,13 +866,14 @@ pub struct VoxelCellIter<
     id_iter: I,
 }
 
-impl <
+impl<
     'a,
     C: Copy + Default + PartialEq,
     S: ChunkSize,
     T: ChunkState<C, S>,
     I: Iterator<Item = CellID<S>>,
-> Iterator for VoxelCellIter<'a, C, S, T, I> {
+> Iterator for VoxelCellIter<'a, C, S, T, I>
+{
     type Item = (CellID<S>, C);
 
     fn next(&mut self) -> Option<Self::Item> {
