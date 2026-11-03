@@ -416,7 +416,7 @@ impl OccupiedExploredNavGrid {
             (FVec3::new(max.x, 0.0, max.z), max)
         };
 
-        let mut last_occupied = None;
+        let mut last_obstacle = None;
 
         self.voxels.segment_cell_skipping_for_each(
             LineSegment {
@@ -424,15 +424,15 @@ impl OccupiedExploredNavGrid {
                 end: test_max,
             },
             |id, cell_state, _| {
-                if cell_state.is_occupied() {
-                    last_occupied = Some(id);
-                } else if last_occupied.is_some() {
+                if cell_state == ExplOccCell::Obstacle {
+                    last_obstacle = Some(id);
+                } else if last_obstacle.is_some() {
                     return false;
                 }
                 true
             },
         );
-        let floor_cell = last_occupied?;
+        let floor_cell = last_obstacle?;
 
         let floor_cell_pos = self.voxels.get_cell_position(floor_cell).unwrap();
         let floor_cell_pos = FVec3::new(
@@ -442,6 +442,12 @@ impl OccupiedExploredNavGrid {
         ) + FVec3::new(0.5, 1.0, 0.5).coords;
 
         Some(self.inv_transform_point(floor_cell_pos))
+    }
+
+    /// writes a Wavefront .obj mesh of every obstacle cell
+    pub fn export_obstacle_obj(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.voxels
+            .export_obj(|_, cstate, _| cstate == ExplOccCell::Obstacle, path)
     }
 
     /// writes a Wavefront .obj mesh of every occupied cell
