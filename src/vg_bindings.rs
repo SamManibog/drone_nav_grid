@@ -148,6 +148,11 @@ pub mod drone_nav_grid {
             self.inner.find_floor(x, z).map(py_emit_fvec3)
         }
 
+        pub fn export_obstacle_obj(&self, path: &str) -> PyResult<()> {
+            self.inner.export_obstacle_obj(PathBuf::from_str(path)?)?;
+            Ok(())
+        }
+
         pub fn export_occupied_obj(&self, path: &str) -> PyResult<()> {
             self.inner.export_occupied_obj(PathBuf::from_str(path)?)?;
             Ok(())
