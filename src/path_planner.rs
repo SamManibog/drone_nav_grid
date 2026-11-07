@@ -25,29 +25,26 @@ impl Corner {
     }
 
     /// gets the pair of nearest corners between the two cells
-    pub fn corner_pair(cell1: IVec2, cell2: IVec2) -> (Corner, Corner) {
+    /// +x is right
+    /// -x is left
+    /// +y is down
+    /// -y is up
+    ///
+    /// returns (corner of cell1 nearest to cell2, corner of cell2 nearest to cell1)
+    pub fn nearest_corners(cell1: IVec2, cell2: IVec2) -> (Corner, Corner) {
         match (cell1.x.cmp(&cell2.x), cell1.y.cmp(&cell2.y)) {
-            (Ordering::Equal, Ordering::Equal)      => (Corner::TopLeft, Corner::TopLeft),
+            (Ordering::Equal, Ordering::Equal) => (Corner::TopLeft, Corner::TopLeft),
 
-            (Ordering::Equal, Ordering::Less)       => (Corner::TopLeft, Corner::BottomLeft),
-            (Ordering::Equal, Ordering::Greater)    => (Corner::BottomLeft, Corner::TopLeft),
+            (Ordering::Equal, Ordering::Less) => (Corner::BottomLeft, Corner::TopLeft),
+            (Ordering::Equal, Ordering::Greater) => (Corner::TopLeft, Corner::BottomLeft),
 
-            (Ordering::Less, Ordering::Equal)       => (Corner::TopRight, Corner::BottomRight),
-            (Ordering::Greater, Ordering::Equal)    => (Corner::BottomRight, Corner::TopRight),
+            (Ordering::Less, Ordering::Equal) => (Corner::TopRight, Corner::TopLeft),
+            (Ordering::Greater, Ordering::Equal) => (Corner::TopLeft, Corner::TopRight),
 
-            (Ordering::Less, Ordering::Less)        => todo!(),
-            (Ordering::Less, Ordering::Greater)     => todo!(),
-            (Ordering::Greater, Ordering::Less)     => todo!(),
-            (Ordering::Greater, Ordering::Greater)  => todo!(),
-        }
-    }
-
-    fn from_is_top_is_left(is_top: bool, is_left: bool) -> Self {
-        match (is_top, is_left) {
-            (true, true)    => Corner::TopLeft,
-            (true, false)   => Corner::TopRight,
-            (false, true)   => Corner::BottomLeft,
-            (false, false)  => Corner::BottomRight,
+            (Ordering::Less, Ordering::Less) => (Corner::BottomRight, Corner::TopLeft),
+            (Ordering::Less, Ordering::Greater) => (Corner::TopRight, Corner::BottomLeft),
+            (Ordering::Greater, Ordering::Less) => (Corner::BottomLeft, Corner::TopRight),
+            (Ordering::Greater, Ordering::Greater) => (Corner::TopLeft, Corner::BottomRight),
         }
     }
 }
