@@ -281,18 +281,18 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
 
     /// runs astar between two points, with the given predicate indicating whether a cell is traversible
     ///
-    /// returns
-    ///  - a path containing the end point of a path exists
+    /// returns (vec, bool)
+    ///  - a path containing the end point of a path exists, and true
     ///  - a path not containing the endpoint if a path does not exist,
-    ///    this path instead returns the reachable point nearest to the end
-    ///  - an empty path if the start or end cells are out of bounds or not traversible
+    ///    this path instead returns the reachable point nearest to the end, and false
+    ///  - an empty path if the start or end cells are out of bounds or not traversible, and false
     pub fn astar<D: IDistanceHeuristic>(
         &self,
         start: CellID<S>,
         end: CellID<S>,
         mut max_explored: usize,
         mut is_occupied: impl FnMut(CellID<S>, C) -> bool,
-    ) -> Vec<CellID<S>> {
+    ) -> (Vec<CellID<S>>, bool) {
         fn reconstruct_path<S: ChunkSize>(
             predecessor_map: HashMap<CellID<S>, CellID<S>>,
             mut current: CellID<S>,
@@ -310,25 +310,25 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
 
         // validate max explored
         if max_explored <= 0 {
-            return Vec::with_capacity(0);
+            return (Vec::with_capacity(0), false);
         }
 
         // validate start and end cells
         {
             let start_state = match self.get_cell(start) {
-                None => return Vec::with_capacity(0),
+                None => return (Vec::with_capacity(0), false),
                 Some(state) => state,
             };
             if is_occupied(start, start_state) {
-                return Vec::with_capacity(0);
+                return (Vec::with_capacity(0), false);
             }
 
             let end_state = match self.get_cell(end) {
-                None => return Vec::with_capacity(0),
+                None => return (Vec::with_capacity(0), false),
                 Some(state) => state,
             };
             if is_occupied(end, end_state) {
-                return Vec::with_capacity(0);
+                return (Vec::with_capacity(0), false);
             }
         }
 
@@ -390,7 +390,7 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
             }
 
             if current.cell == end {
-                return reconstruct_path(predecessor_map, current.cell);
+                return (reconstruct_path(predecessor_map, current.cell), true);
             }
 
             'neighbor: for neighbor in self.cell_face_connective_neighbors(current.cell) {
@@ -423,33 +423,33 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
                 }
 
                 if max_explored <= 0 {
-                    return reconstruct_path(predecessor_map, nearest);
+                    return (reconstruct_path(predecessor_map, nearest), false);
                 }
             }
         }
 
-        reconstruct_path(predecessor_map, nearest)
+        (reconstruct_path(predecessor_map, nearest), false)
     }
 
     /// runs astar between two points, with the given predicate indicating whether a cell is traversible
     ///
     /// then uses greedy string pulling for path smoothing
     ///
-    /// returns
-    ///  - a path containing the end point of a path exists
+    /// returns (vec, bool)
+    ///  - a path containing the end point of a path exists, true
     ///  - a path not containing the endpoint if a path does not exist,
-    ///    this path instead returns the reachable point nearest to the end
-    ///  - an empty path if the start or end cells are out of bounds or not traversible
+    ///    this path instead returns the reachable point nearest to the end, false
+    ///  - an empty path if the start or end cells are out of bounds or not traversible, false
     pub fn funnelled_astar<D: IDistanceHeuristic>(
         &self,
         start: CellID<S>,
         end: CellID<S>,
         max_explored: usize,
         mut is_occupied: impl FnMut(CellID<S>, C) -> bool,
-    ) -> Vec<CellID<S>> {
-        let path = self.astar::<D>(start, end, max_explored, &mut is_occupied);
+    ) -> (Vec<CellID<S>>, bool) {
+        let (path, success) = self.astar::<D>(start, end, max_explored, &mut is_occupied);
         if path.len() <= 2 {
-            return path;
+            return (path, success);
         }
 
         let view = VoxelCellView::new(self); // lives across all LOS queries so the cache carries over
@@ -484,7 +484,8 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
             smoothed.push(path[next]);
             i = next;
         }
-        smoothed
+
+        (smoothed, success)
     }
 
     /// gets a breadth-first traversing iterator around the given cell

@@ -20,7 +20,7 @@ use crate::{
 pub enum ExplOccCell {
     #[default]
     Unexplored,
-    EmptyExplored,
+    Empty,
     SafetyOccupied,
     Obstacle,
 }
@@ -37,7 +37,7 @@ impl ExplOccCell {
     pub const fn into_i32(&self) -> i32 {
         match self {
             Self::Unexplored => -1,
-            Self::EmptyExplored => 0,
+            Self::Empty => 0,
             Self::SafetyOccupied => 1,
             Self::Obstacle => 2,
         }
@@ -302,7 +302,7 @@ impl OccupiedExploredNavGrid {
                 },
                 |_, cell, _| {
                     if !cell.is_occupied() {
-                        *cell = ExplOccCell::EmptyExplored;
+                        *cell = ExplOccCell::Empty;
                     }
                     true
                 },
@@ -373,9 +373,15 @@ impl OccupiedExploredNavGrid {
     /// if start is inside an occupied cell (e.g. within a safety margin), the nearest unoccupied
     /// cell is used as the starting point so the agent can path out of the margin
     /// if the end cell itself is occupied, no path is returned
-    pub fn pathfind(&self, start: FVec3, end: FVec3, search_size: usize) -> Vec<FVec3> {
+    ///
+    /// returns (vec, bool)
+    ///  - a path containing the end point of a path exists, true
+    ///  - a path not containing the endpoint if a path does not exist,
+    ///    this path instead returns the reachable point nearest to the end, false
+    ///  - an empty path if the start or end cells are out of bounds or not traversible, false
+    pub fn pathfind(&self, start: FVec3, end: FVec3, search_size: usize) -> (Vec<FVec3>, bool) {
         if !self.is_in_bounds(end) {
-            return Vec::with_capacity(0);
+            return (Vec::with_capacity(0), false);
         }
 
         let Some(start_cell) = self
@@ -383,22 +389,30 @@ impl OccupiedExploredNavGrid {
             .get_cell_id(self.cell_position_from_world_point(start))
             .and_then(|id| self.nearest_unoccupied_cell(id))
         else {
-            return Vec::with_capacity(0);
+            return (Vec::with_capacity(0), false);
         };
         let Some(end_cell) = self
             .voxels
             .get_cell_id(self.cell_position_from_world_point(end))
         else {
-            return Vec::with_capacity(0);
+            return (Vec::with_capacity(0), false);
         };
 
-        self.voxels
-            .funnelled_astar::<IManhattanDistance>(start_cell, end_cell, search_size, |_, c| {
-                ExplOccCell::is_occupied(&c)
-            })
-            .into_iter()
-            .map(|p| self.world_point_from_cell_center(self.voxels.get_cell_position(p).unwrap()))
-            .collect()
+        let (path, success) = self.voxels.funnelled_astar::<IManhattanDistance>(
+            start_cell,
+            end_cell,
+            search_size,
+            |_, c| ExplOccCell::is_occupied(&c),
+        );
+
+        (
+            path.into_iter()
+                .map(|p| {
+                    self.world_point_from_cell_center(self.voxels.get_cell_position(p).unwrap())
+                })
+                .collect(),
+            success,
+        )
     }
 
     /// attempts to get the y position of the floor at the given x, z coordinate
@@ -459,6 +473,6 @@ impl OccupiedExploredNavGrid {
     /// writes a Wavefront .obj mesh of every explored, unoccupied cell
     pub fn export_explored_obj(&self, path: impl AsRef<Path>) -> io::Result<()> {
         self.voxels
-            .export_obj(|_, cstate, _| cstate == ExplOccCell::EmptyExplored, path)
+            .export_obj(|_, cstate, _| cstate == ExplOccCell::Empty, path)
     }
 }

@@ -1,7 +1,76 @@
+use std::cmp::Ordering;
+
 use bit_set::BitSet;
 use bit_vec::BitVec;
 
 use crate::math::IVec2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Corner {
+    /// gets the opposite corner
+    pub fn opposite(self) -> Self {
+        match self {
+            Corner::TopLeft => Corner::BottomRight,
+            Corner::TopRight => Corner::BottomLeft,
+            Corner::BottomLeft => Corner::TopRight,
+            Corner::BottomRight => Corner::TopLeft,
+        }
+    }
+
+    /// gets the pair of nearest corners between the two cells
+    pub fn corner_pair(cell1: IVec2, cell2: IVec2) -> (Corner, Corner) {
+        match (cell1.x.cmp(&cell2.x), cell1.y.cmp(&cell2.y)) {
+            (Ordering::Equal, Ordering::Equal)      => (Corner::TopLeft, Corner::TopLeft),
+
+            (Ordering::Equal, Ordering::Less)       => (Corner::TopLeft, Corner::BottomLeft),
+            (Ordering::Equal, Ordering::Greater)    => (Corner::BottomLeft, Corner::TopLeft),
+
+            (Ordering::Less, Ordering::Equal)       => (Corner::TopRight, Corner::BottomRight),
+            (Ordering::Greater, Ordering::Equal)    => (Corner::BottomRight, Corner::TopRight),
+
+            (Ordering::Less, Ordering::Less)        => todo!(),
+            (Ordering::Less, Ordering::Greater)     => todo!(),
+            (Ordering::Greater, Ordering::Less)     => todo!(),
+            (Ordering::Greater, Ordering::Greater)  => todo!(),
+        }
+    }
+
+    fn from_is_top_is_left(is_top: bool, is_left: bool) -> Self {
+        match (is_top, is_left) {
+            (true, true)    => Corner::TopLeft,
+            (true, false)   => Corner::TopRight,
+            (false, true)   => Corner::BottomLeft,
+            (false, false)  => Corner::BottomRight,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WaypointMoveCmd {
+    /// repeat command until cant anymore
+    Inf(IVec2),
+
+    /// repeat command once
+    One(IVec2),
+}
+
+// movement pattern for top left to bottom right corner
+// assumes positive y is down, positive x is right
+const MOVEMENT_PATTERN: [WaypointMoveCmd; 6] = [
+    WaypointMoveCmd::Inf(IVec2::new(0, 1)),
+    WaypointMoveCmd::One(IVec2::new(1, 0)),
+    WaypointMoveCmd::Inf(IVec2::new(0, -1)),
+    WaypointMoveCmd::Inf(IVec2::new(1, 0)),
+    WaypointMoveCmd::One(IVec2::new(0, 1)),
+    WaypointMoveCmd::Inf(IVec2::new(-1, 0)),
+];
 
 #[derive(Debug, Clone)]
 pub struct ScoreGrid {

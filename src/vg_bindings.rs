@@ -6,7 +6,7 @@ pub mod drone_nav_grid {
 
     use crate::{
         math::{Aabb, FVec3, IVec2, IVec3},
-        nav_grid::OccupiedExploredNavGrid,
+        nav_grid::{ExplOccCell, OccupiedExploredNavGrid},
         path_planner::{PathPlanningProblem, ScoreGrid},
     };
 
@@ -49,13 +49,16 @@ pub mod drone_nav_grid {
     #[pymethods]
     impl PyNavGrid {
         #[classattr]
-        const OCCUPIED: i32 = 1;
+        const SAFETY_OCCUPIED: i32 = ExplOccCell::SafetyOccupied.into_i32();
 
         #[classattr]
-        const EMPTY_EXPLORED: i32 = 0;
+        const EMPTY: i32 = ExplOccCell::Empty.into_i32();
 
         #[classattr]
-        const EMPTY_UNEXPLORED: i32 = -1;
+        const UNEXPLORED: i32 = ExplOccCell::Unexplored.into_i32();
+
+        #[classattr]
+        const OBSTACLE: i32 = ExplOccCell::Obstacle.into_i32();
 
         /// constructs a new navigation grid using the given aabb
         #[new]
@@ -81,27 +84,38 @@ pub mod drone_nav_grid {
             })
         }
 
+        /// the size of a unit cell
         pub fn unit_size(&self) -> f32 {
             self.inner.unit_size()
         }
 
+        /// the world dimensions of the grid
         pub fn dimensions(&self) -> Vec<f32> {
             py_emit_fvec3(self.inner.dimensions())
         }
 
+        /// the number of cells in each dimension
         pub fn cell_dimensions(&self) -> Vec<isize> {
             py_emit_ivec3(self.inner.cell_dimensions())
         }
 
+        /// the world aabb
         pub fn aabb(&self) -> (Vec<f32>, Vec<f32>) {
             py_emit_faabb(self.inner.aabb())
         }
 
+        /// whether a world-coordinate point is in bounds
         pub fn is_in_bounds(&self, point: &Bound<'_, PyAny>) -> PyResult<bool> {
             let p = py_parse_fvec3(point)?;
             Ok(self.inner.is_in_bounds(p))
         }
 
+        /// gets the state of the cell at the given position
+        /// check against
+        ///  - NavGrid.SAFETY_OCCUPIED
+        ///  - NavGrid.UNEXPLORED
+        ///  - NavGrid.OBSTACLE
+        ///  - NavGrid.EMPTY
         pub fn cell_at(&self, position: &Bound<'_, PyAny>) -> PyResult<i32> {
             let p = py_parse_fvec3(position)?;
             let cell = self.inner.cell_at(p);
@@ -109,6 +123,7 @@ pub mod drone_nav_grid {
             Ok(cell.into())
         }
 
+        /// gets the empty position nearest to the given position
         pub fn nearest_safe_position(
             &self,
             position: &Bound<'_, PyAny>,
@@ -118,6 +133,13 @@ pub mod drone_nav_grid {
             Ok(self.inner.nearest_safe_position(pos).map(py_emit_fvec3))
         }
 
+        /// handles a simulated lidar scan were
+        /// start - the sensor position
+        /// endpoints - the detected lidar endpoint RELATIVE to the start position
+        /// range - how far an endpoint can travel before being ignored
+        /// safety_margin - how far to expand a detected obstacle for pathfinding purposes
+        ///
+        /// returns a list containing the positions of every detected obstacle
         pub fn handle_scan(
             &mut self,
             start: &Bound<'_, PyAny>,
@@ -141,37 +163,53 @@ pub mod drone_nav_grid {
                 .collect())
         }
 
+        /// pathfind between two points using the given search size
+        ///
+        /// makes a best effort to get to the end point, returning the found path that
+        /// ends nearest to the specified end point
+        ///
+        /// returns a tuple: (path, success)
+        ///  - path is the best-effort path to the endpoint
+        ///     - if the start or endpoints are invalid, path will be empty
+        ///  - success is whether or not the endpoint was successfully found
         pub fn pathfind(
             &self,
             start: &Bound<'_, PyAny>,
             end: &Bound<'_, PyAny>,
             search_size: usize,
-        ) -> PyResult<Vec<Vec<f32>>> {
+        ) -> PyResult<(Vec<Vec<f32>>, bool)> {
             let start = py_parse_fvec3(start)?;
             let end = py_parse_fvec3(end)?;
 
-            Ok(self
-                .inner
-                .pathfind(start, end, search_size)
-                .into_iter()
-                .map(|p| py_emit_fvec3(p))
-                .collect())
+            let (path, success) = self.inner.pathfind(start, end, search_size);
+
+            Ok((
+                path.into_iter().map(|p| py_emit_fvec3(p)).collect(),
+                success,
+            ))
         }
 
+        /// gets coordinates of the floor under the given x and z position
         pub fn find_floor(&self, x: f32, z: f32) -> Option<Vec<f32>> {
             self.inner.find_floor(x, z).map(py_emit_fvec3)
         }
 
+        /// attempts to export the obstacles detected in the navigation grid to
+        /// a .obj file
         pub fn export_obstacle_obj(&self, path: &str) -> PyResult<()> {
             self.inner.export_obstacle_obj(PathBuf::from_str(path)?)?;
             Ok(())
         }
 
+        /// attempts to export the occupied cells in the navigation grid to
+        /// a .obj file
         pub fn export_occupied_obj(&self, path: &str) -> PyResult<()> {
             self.inner.export_occupied_obj(PathBuf::from_str(path)?)?;
             Ok(())
         }
 
+        /// attempts to export the explored cells in the navigation grid to
+        /// a .obj file
         pub fn export_explored_obj(&self, path: &str) -> PyResult<()> {
             self.inner.export_explored_obj(PathBuf::from_str(path)?)?;
             Ok(())
@@ -185,6 +223,7 @@ pub mod drone_nav_grid {
 
     #[pymethods]
     impl PyPathPlanningProblem {
+        /// constructs a new path planning problem
         #[new]
         #[pyo3(signature = (*, start_position, scores, node_cost, distance_multiplier, max_cost))]
         fn __new__(
@@ -198,8 +237,8 @@ pub mod drone_nav_grid {
             let start_position = py_parse_ivec2(start_position)?;
 
             // Build the ScoreGrid, handling any validation errors as Python ValueErrors
-            let scores_grid = ScoreGrid::new(scores)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+            let scores_grid =
+                ScoreGrid::new(scores).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
             let inner = PathPlanningProblem {
                 start_position,
@@ -209,11 +248,14 @@ pub mod drone_nav_grid {
                 max_cost,
             };
 
-            inner.validate().map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+            inner
+                .validate()
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
             Ok(Self { inner })
         }
 
+        /// solves the path planning problem, returning the positions of cells
         pub fn solve(&self) -> Vec<Vec<isize>> {
             let soln = self.inner.greedy_prob_distance_ratio_soln();
             self.inner
