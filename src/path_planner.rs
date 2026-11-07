@@ -192,7 +192,7 @@ pub struct PathPlanningProblem {
 impl PathPlanningProblem {
     /// ensures the problem definition is valid
     pub fn validate(&self) -> Result<(), String> {
-        if self.max_cost < 0.0 {
+        if self.max_cost < 0.0 && !self.max_cost.is_nan() {
             return Err("Max cost must be non-negative".to_string());
         }
 

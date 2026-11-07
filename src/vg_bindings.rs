@@ -1,6 +1,6 @@
 #[pyo3::pymodule(name = "drone_nav_grid")]
 pub mod drone_nav_grid {
-    use pyo3::{PyAny, exceptions::PyException, prelude::*};
+    use pyo3::{PyAny, exceptions::{PyException, PyValueError}, prelude::*};
 
     use std::{path::PathBuf, str::FromStr};
 
@@ -69,6 +69,10 @@ pub mod drone_nav_grid {
         ) -> PyResult<Self> {
             let min = py_parse_fvec3(min)?;
             let max = py_parse_fvec3(max)?;
+
+            if !min.coords.iter().chain(max.coords.iter()).all(|v| v.is_finite()) {
+                return Err(pyo3::exceptions::PyValueError::new_err("min and max must be finite."));
+            }
 
             if Aabb::<FVec3>::new(min, max).is_empty() {
                 return PyResult::Err(PyErr::new::<PyException, _>("min must be less than max."));
@@ -139,7 +143,7 @@ pub mod drone_nav_grid {
         /// range - how far an endpoint can travel before being ignored
         /// safety_margin - how far to expand a detected obstacle for pathfinding purposes
         ///
-        /// returns a list containing the positions of every detected obstacle
+        /// returns a list containing the positions of every newly-detected obstacle
         pub fn handle_scan(
             &mut self,
             start: &Bound<'_, PyAny>,
@@ -148,6 +152,13 @@ pub mod drone_nav_grid {
             safety_margin: f32,
         ) -> PyResult<Vec<Vec<f32>>> {
             let start = py_parse_fvec3(start)?;
+
+            if !range.is_finite() || range < 0.0 {
+                return Err(PyValueError::new_err("range must be finite and non-negative"));
+            }
+            if !safety_margin.is_finite() || safety_margin < 0.0 {
+                return Err(PyValueError::new_err("safety_margin must be finite and non-negative"));
+            }
 
             let mut ep_vec: Vec<FVec3> = Vec::new();
             for ep in endpoints.try_iter()? {
@@ -189,9 +200,14 @@ pub mod drone_nav_grid {
             ))
         }
 
-        /// gets coordinates of the floor under the given x and z position
-        pub fn find_floor(&self, x: f32, z: f32) -> Option<Vec<f32>> {
-            self.inner.find_floor(x, z).map(py_emit_fvec3)
+        /// gets the y coordinate of the top of the lowest detected obstacle in this column
+        /// returns NaN if no floor exists
+        pub fn find_floor(&self, x: f32, z: f32) -> f32 {
+            if let Some(vector) = self.inner.find_floor(x, z) {
+                vector.y
+            } else {
+                f32::NAN
+            }
         }
 
         /// attempts to export the obstacles detected in the navigation grid to
@@ -208,7 +224,7 @@ pub mod drone_nav_grid {
             Ok(())
         }
 
-        /// attempts to export the explored cells in the navigation grid to
+        /// attempts to export the explored, unoccupied cells in the navigation grid to
         /// a .obj file
         pub fn export_explored_obj(&self, path: &str) -> PyResult<()> {
             self.inner.export_explored_obj(PathBuf::from_str(path)?)?;
