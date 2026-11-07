@@ -2,6 +2,8 @@ use std::{iter::Peekable, marker::PhantomData};
 
 use nalgebra::SimdPartialOrd;
 
+pub type IVec2 = nalgebra::Point2<isize>;
+pub type FVec2 = nalgebra::Point2<f32>;
 pub type IVec3 = nalgebra::Point3<isize>;
 pub type FVec3 = nalgebra::Point3<f32>;
 

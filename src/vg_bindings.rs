@@ -1,24 +1,27 @@
 #[pyo3::pymodule(name = "drone_nav_grid")]
 pub mod drone_nav_grid {
-    use pyo3::{exceptions::PyException, prelude::*};
+    use pyo3::{PyAny, exceptions::PyException, prelude::*};
 
     use std::{path::PathBuf, str::FromStr};
 
     use crate::{
-        math::{Aabb, FVec3, IVec3},
+        math::{Aabb, FVec3, IVec2, IVec3},
         nav_grid::OccupiedExploredNavGrid,
+        path_planner::{PathPlanningProblem, ScoreGrid},
     };
-
-    #[pyclass(name = "NavGrid")]
-    pub struct PyNavGrid {
-        inner: OccupiedExploredNavGrid,
-    }
 
     fn py_parse_fvec3(py_any: &Bound<'_, PyAny>) -> PyResult<FVec3> {
         Ok(FVec3::new(
             py_any.get_item(0)?.extract::<f32>()?,
             py_any.get_item(1)?.extract::<f32>()?,
             py_any.get_item(2)?.extract::<f32>()?,
+        ))
+    }
+
+    fn py_parse_ivec2(py_any: &Bound<'_, PyAny>) -> PyResult<IVec2> {
+        Ok(IVec2::new(
+            py_any.get_item(0)?.extract::<isize>()?,
+            py_any.get_item(1)?.extract::<isize>()?,
         ))
     }
 
@@ -30,8 +33,17 @@ pub mod drone_nav_grid {
         vec![v.x, v.y, v.z]
     }
 
+    fn py_emit_ivec2(v: IVec2) -> Vec<isize> {
+        vec![v.x, v.y]
+    }
+
     fn py_emit_faabb(aabb: Aabb<FVec3>) -> (Vec<f32>, Vec<f32>) {
         (py_emit_fvec3(aabb.min), py_emit_fvec3(aabb.max))
+    }
+
+    #[pyclass(name = "NavGrid")]
+    pub struct PyNavGrid {
+        inner: OccupiedExploredNavGrid,
     }
 
     #[pymethods]
@@ -59,7 +71,9 @@ pub mod drone_nav_grid {
                 return PyResult::Err(PyErr::new::<PyException, _>("min must be less than max."));
             }
             if unit_size <= 0.0 || !unit_size.is_finite() {
-                return PyResult::Err(PyErr::new::<PyException, _>("unit_size must be positive and finite."));
+                return PyResult::Err(PyErr::new::<PyException, _>(
+                    "unit_size must be positive and finite.",
+                ));
             }
 
             Ok(Self {
@@ -161,6 +175,52 @@ pub mod drone_nav_grid {
         pub fn export_explored_obj(&self, path: &str) -> PyResult<()> {
             self.inner.export_explored_obj(PathBuf::from_str(path)?)?;
             Ok(())
+        }
+    }
+
+    #[pyclass(name = "PathPlanningProblem")]
+    pub struct PyPathPlanningProblem {
+        inner: PathPlanningProblem,
+    }
+
+    #[pymethods]
+    impl PyPathPlanningProblem {
+        #[new]
+        #[pyo3(signature = (*, start_position, scores, node_cost, distance_multiplier, max_cost))]
+        fn __new__(
+            start_position: &Bound<'_, PyAny>,
+            scores: Vec<Vec<f32>>,
+            node_cost: f32,
+            distance_multiplier: f32,
+            max_cost: f32,
+        ) -> PyResult<Self> {
+            // Extract start_position from a Python tuple/list (x, y)
+            let start_position = py_parse_ivec2(start_position)?;
+
+            // Build the ScoreGrid, handling any validation errors as Python ValueErrors
+            let scores_grid = ScoreGrid::new(scores)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+            let inner = PathPlanningProblem {
+                start_position,
+                scores: scores_grid,
+                node_cost,
+                distance_multiplier,
+                max_cost,
+            };
+
+            inner.validate().map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+            Ok(Self { inner })
+        }
+
+        pub fn solve(&self) -> Vec<Vec<isize>> {
+            let soln = self.inner.greedy_prob_distance_ratio_soln();
+            self.inner
+                .scores
+                .map_indices(soln.into_iter())
+                .map(py_emit_ivec2)
+                .collect()
         }
     }
 }

@@ -94,6 +94,7 @@ name = "drone_nav_grid"
 version = "0.1.0"
 dependencies = [
  "bit-set",
+ "bit-vec",
  "delegate",
  "nalgebra",
  "pyo3",
