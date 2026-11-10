@@ -280,8 +280,8 @@ impl OccupiedExploredNavGrid {
         let mut hit_cells: HashSet<CellPosition> = HashSet::new();
 
         for endpoint in endpoints {
-            let end_v = self.transform_point(start + endpoint.coords);
-            let delta = end_v - start_v;
+            let delta = endpoint.coords / self.unit_size;
+            let end_v = start_v + delta;
             let len = delta.norm();
             if !len.is_finite() {
                 continue;
@@ -309,17 +309,17 @@ impl OccupiedExploredNavGrid {
             );
 
             // an in-range endpoint inside the grid is an obstacle hit
-            if in_range {
-                let hit = floor_fvec3(&end_v);
-                if hit.x >= 0
-                    && hit.y >= 0
-                    && hit.z >= 0
-                    && hit.x < cell_dims.x
-                    && hit.y < cell_dims.y
-                    && hit.z < cell_dims.z
-                {
-                    hit_cells.insert(CellPosition(hit));
-                }
+            let dir = delta / len; // skip beams with len == 0
+            let hit = floor_fvec3(&(end_v + dir * 1e-3)) // 1e-3 of a cell
+                .simd_clamp(IVec3::new(0, 0, 0), cell_dims - IVec3::new(1, 1, 1).coords);
+            let inside = end_v.x >= 0.0
+                && end_v.x <= cell_dims.x as f32
+                && end_v.y >= 0.0
+                && end_v.y <= cell_dims.y as f32
+                && end_v.z >= 0.0
+                && end_v.z <= cell_dims.z as f32;
+            if in_range && inside {
+                hit_cells.insert(CellPosition(hit));
             }
         }
 
@@ -352,14 +352,21 @@ impl OccupiedExploredNavGrid {
                 IVec3::new(hit.x + radius + 1, hit.y + radius + 1, hit.z + radius + 1),
             );
 
+            let mut newly = false;
             self.voxels
                 .aabb_cell_initializing_for_each_mut(region, |pos, cell, _| {
-                    if ivec3_dist_sq(&pos, &hit) as f32 <= margin_sq {
-                        if !cell.is_occupied() {
-                            *cell = ExplOccCell::SafetyOccupied
+                    if *pos == *hit {
+                        if *cell != ExplOccCell::Obstacle {
+                            *cell = ExplOccCell::Obstacle;
+                            newly = true;
                         }
+                    } else if !cell.is_occupied() && ivec3_dist_sq(&pos, &hit) as f32 <= margin_sq {
+                        *cell = ExplOccCell::SafetyOccupied;
                     }
                 });
+            if newly {
+                output.push(self.inv_transform_point(hit.center()));
+            }
         }
 
         output
@@ -432,7 +439,7 @@ impl OccupiedExploredNavGrid {
 
         let mut last_obstacle = None;
 
-        self.voxels.segment_cell_skipping_for_each(
+        self.voxels.segment_cell_for_each(
             LineSegment {
                 start: test_min,
                 end: test_max,

@@ -273,7 +273,7 @@ pub mod drone_nav_grid {
 
         /// solves the path planning problem, returning the positions of cells
         pub fn solve(&self) -> Vec<Vec<isize>> {
-            let soln = self.inner.greedy_prob_distance_ratio_soln();
+            let soln = self.inner.greedy_score_distance_ratio_soln().0;
             self.inner
                 .scores
                 .map_indices(soln.into_iter())

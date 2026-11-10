@@ -625,12 +625,29 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
     ) {
         // the id iterator owns copies of the dimensions, so it does not borrow self
         for id in self.segment_cell_id_iter(segment) {
-            self.get_chunk_mut(id.chunk_id(), |chunk| {
+            if self.get_chunk_mut(id.chunk_id(), |chunk| {
                 chunk.init();
-                if !chunk.get_cell_mut(id.local_index(), |_, cell, state| visit(id, cell, state)) {
-                    return;
-                }
-            });
+                chunk.get_cell_mut(id.local_index(), |_, cell, state| visit(id, cell, state))
+            }) == Some(false)
+            {
+                return;
+            }
+        }
+    }
+
+    /// visits all cells in the given segment
+    /// visit should return true if iteration should continue and false if iteration should end
+    pub fn segment_cell_for_each(
+        &self,
+        segment: LineSegment,
+        mut visit: impl FnMut(CellID<S>, C, &T) -> bool,
+    ) {
+        for id in self.segment_cell_id_iter(segment) {
+            let chunk = self.get_chunk(id.chunk_id()).unwrap();
+            let cell = chunk.get_cell(id.local_index());
+            if !visit(id, cell, &chunk.user_state) {
+                return;
+            }
         }
     }
 
