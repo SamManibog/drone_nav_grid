@@ -119,23 +119,6 @@ impl ScoreGrid {
     }
 }
 
-/// generates a snaking path through a grid with the given dimensions
-pub fn snaking_path(dimensions: IVec2) -> Vec<usize> {
-    let mut path = Vec::new();
-    for i in 0..dimensions.x {
-        if i % 2 == 0 {
-            for j in 0..dimensions.y {
-                path.push(grid_index(IVec2::new(i, j), dimensions.x))
-            }
-        } else {
-            for j in (0..dimensions.y).rev() {
-                path.push(grid_index(IVec2::new(i, j), dimensions.x))
-            }
-        }
-    }
-    path
-}
-
 #[derive(Debug, Clone)]
 pub struct PathPlanningProblem {
     /// the starting node (need not be explored as first move)
@@ -1169,6 +1152,420 @@ impl PathPlanningProblem {
         soln
     }
 
+// Replace the existing `greedy_clustering_soln` (the one ending in `todo!()`) inside
+// `impl PathPlanningProblem` with everything below. No new imports are needed.
+
+    /// greedy solution with a multi-pass strategy
+    ///
+    /// the general strategy is as follows
+    ///  - collect nodes into high-scoring clusters
+    ///    - select top fraction of nodes by score (only nodes with positive score)
+    ///    - join all adjacent (8-connected) nodes in the top fraction into clusters
+    ///  - determine the shortest path between clusters
+    ///    - the distance between two clusters is the distance between their closest pair of
+    ///      nodes, and that pair is where the path leaves one cluster and enters the other
+    ///    - create a tour over the cluster graph (nearest neighbour), run two-opt on that tour
+    ///    - convert the tour into a non-cycle path: begin at the cluster containing the node
+    ///      nearest to `start_position`, and break the longer of that cluster's two tour edges
+    ///  - for each cluster, determine the path through the nodes in the cluster (entry and
+    ///    exit nodes are determined by the incoming/outgoing cluster links)
+    ///    - join nodes by nearest neighbour
+    ///    - run two-opt on that path (with the entry and, if there is one, the exit node fixed)
+    ///  - fill gaps
+    ///    - if the generated path exceeds cost, run `greedy_efficiency_path_shrink`
+    ///    - if the generated path can be extended, greedily insert the node and edge to insert
+    ///      on that maximize `node_score^2 / additional_cost`
+    ///
+    /// the cluster distance matrix is O(k^2) in memory for k clusters, and computing it is
+    /// O(t^2) in the number of top nodes t. gap filling is O(n * path_len) per inserted node
+    pub fn greedy_clustering_soln(&self) -> SolutionInfo {
+        /// the ratio of nodes to select initially to node count
+        const TOP_RATIO: f32 = 0.2;
+        /// minimum improvement to accept a tour two-opt move
+        const EPSILON: f32 = 1e-4;
+        /// cap on two-opt passes over the cluster tour
+        const MAX_TOUR_PASSES: usize = 50;
+
+        let empty = || SolutionInfo {
+            path: Vec::new(),
+            score: 0.0,
+            cost: 0.0,
+        };
+
+        let node_count = self.scores.node_count();
+        if node_count == 0 || self.max_cost <= 0.0 {
+            return empty();
+        }
+
+        // select top nodes (highest score first), ignoring nodes that cannot add score
+        let top_nodes: Vec<usize> = {
+            let mut ranked = Vec::from_iter(0..node_count);
+            ranked.sort_unstable_by(|&a, &b| {
+                self.scores
+                    .get_score_by_index(b)
+                    .total_cmp(&self.scores.get_score_by_index(a))
+            });
+            let take = ((node_count as f32 * TOP_RATIO).ceil() as usize).clamp(1, node_count);
+            ranked.truncate(take);
+            ranked.retain(|&i| self.scores.get_score_by_index(i) > 0.0);
+            ranked
+        };
+        if top_nodes.is_empty() {
+            return empty();
+        }
+
+        // make clusters (sets) of adjacent nodes
+        // note that disjoint set expects to be for the entire grid
+        let mut in_top = vec![false; node_count];
+        for &n in &top_nodes {
+            in_top[n] = true;
+        }
+
+        let mut sets = DisjointNodeSet::new(node_count);
+        for &n in &top_nodes {
+            let pos = self.scores.node_pos(n);
+            for dy in -1..=1isize {
+                for dx in -1..=1isize {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let neighbour = IVec2::new(pos.x + dx, pos.y + dy);
+                    if !self.scores.contains_pos(neighbour) {
+                        continue;
+                    }
+                    let neighbour_index = self.scores.node_index(neighbour);
+                    if in_top[neighbour_index] {
+                        sets.union(n, neighbour_index);
+                    }
+                }
+            }
+        }
+
+        // gather the members of each cluster
+        let mut root_to_cluster = vec![usize::MAX; node_count];
+        let mut cluster_of = vec![0usize; node_count];
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for &n in &top_nodes {
+            let root = sets.find(n);
+            if root_to_cluster[root] == usize::MAX {
+                root_to_cluster[root] = clusters.len();
+                clusters.push(Vec::new());
+            }
+            let c = root_to_cluster[root];
+            clusters[c].push(n);
+            cluster_of[n] = c;
+        }
+        let k = clusters.len();
+
+        // min distance between each cluster pair, and the node pair that achieves it
+        // `links[a * k + b]` is (node in a, node in b)
+        let mut dist = vec![f32::INFINITY; k * k];
+        let mut links = vec![(0usize, 0usize); k * k];
+        for c in 0..k {
+            dist[c * k + c] = 0.0;
+        }
+        for (ai, &a) in top_nodes.iter().enumerate() {
+            let ca = cluster_of[a];
+            let pa = self.scores.node_pos(a);
+            for &b in &top_nodes[ai + 1..] {
+                let cb = cluster_of[b];
+                if ca == cb {
+                    continue;
+                }
+                let d = grid_dist(pa, self.scores.node_pos(b));
+                if d < dist[ca * k + cb] {
+                    dist[ca * k + cb] = d;
+                    dist[cb * k + ca] = d;
+                    links[ca * k + cb] = (a, b);
+                    links[cb * k + ca] = (b, a);
+                }
+            }
+        }
+
+        // the cluster containing the top node nearest to the start position begins the path
+        let start_node = top_nodes
+            .iter()
+            .copied()
+            .min_by(|&a, &b| {
+                grid_dist(self.start_position, self.scores.node_pos(a))
+                    .total_cmp(&grid_dist(self.start_position, self.scores.node_pos(b)))
+            })
+            .unwrap();
+        let start_cluster = cluster_of[start_node];
+
+        // nearest neighbour tour over the clusters
+        let mut tour = Vec::with_capacity(k);
+        let mut visited = vec![false; k];
+        let mut cur = start_cluster;
+        visited[cur] = true;
+        tour.push(cur);
+        while tour.len() < k {
+            let next = (0..k)
+                .filter(|&c| !visited[c])
+                .min_by(|&a, &b| dist[cur * k + a].total_cmp(&dist[cur * k + b]))
+                .unwrap();
+            visited[next] = true;
+            tour.push(next);
+            cur = next;
+        }
+
+        // two-opt on the (cyclic) tour
+        if k >= 4 {
+            for _ in 0..MAX_TOUR_PASSES {
+                let mut improved = false;
+                for i in 0..k - 1 {
+                    for j in i + 2..k {
+                        // edges (i, i+1) and (j, j+1) are adjacent when they share the wrap node
+                        if i == 0 && j == k - 1 {
+                            continue;
+                        }
+                        let (a, b) = (tour[i], tour[i + 1]);
+                        let (c, d) = (tour[j], tour[(j + 1) % k]);
+                        let delta =
+                            dist[a * k + c] + dist[b * k + d] - dist[a * k + b] - dist[c * k + d];
+                        if delta < -EPSILON {
+                            tour[i + 1..=j].reverse();
+                            improved = true;
+                        }
+                    }
+                }
+                if !improved {
+                    break;
+                }
+            }
+        }
+
+        // turn the cycle into a path beginning at the start cluster by breaking the longer of
+        // the start cluster's two edges
+        let start_index = tour.iter().position(|&c| c == start_cluster).unwrap();
+        tour.rotate_left(start_index);
+        if k >= 3 && dist[start_cluster * k + tour[1]] > dist[start_cluster * k + tour[k - 1]] {
+            tour[1..].reverse();
+        }
+
+        // order the nodes inside each cluster, entering and leaving at the cluster links
+        let mut path = Vec::with_capacity(top_nodes.len());
+        for (p, &c) in tour.iter().enumerate() {
+            let members = &clusters[c];
+
+            let entry = if p == 0 {
+                members
+                    .iter()
+                    .copied()
+                    .min_by(|&a, &b| {
+                        grid_dist(self.start_position, self.scores.node_pos(a))
+                            .total_cmp(&grid_dist(self.start_position, self.scores.node_pos(b)))
+                    })
+                    .unwrap()
+            } else {
+                links[tour[p - 1] * k + c].1
+            };
+
+            let exit = if p + 1 < k {
+                let (exit_candidate, next_entry) = links[c * k + tour[p + 1]];
+                if exit_candidate != entry || members.len() == 1 {
+                    Some(exit_candidate)
+                } else {
+                    // entering and leaving at the same node would skip the cluster's interior,
+                    // so leave from the other member closest to the next cluster's entry
+                    let next_entry_pos = self.scores.node_pos(next_entry);
+                    members
+                        .iter()
+                        .copied()
+                        .filter(|&m| m != entry)
+                        .min_by(|&a, &b| {
+                            grid_dist(self.scores.node_pos(a), next_entry_pos)
+                                .total_cmp(&grid_dist(self.scores.node_pos(b), next_entry_pos))
+                        })
+                }
+            } else {
+                None
+            };
+
+            path.extend(self.cluster_node_order(members, entry, exit));
+        }
+
+        let mut soln = SolutionInfo {
+            path,
+            score: 0.0,
+            cost: 0.0,
+        };
+
+        // fill gaps: shrink until valid (recomputing to remove drift), then expand
+        loop {
+            self.update_score_and_cost(&mut soln);
+            if soln.cost <= self.max_cost || soln.path.is_empty() {
+                break;
+            }
+            self.greedy_efficiency_path_shrink(&mut soln);
+        }
+        self.greedy_insertion_path_expand(&mut soln);
+        self.update_score_and_cost(&mut soln);
+
+        soln
+    }
+
+    /// orders the nodes of a single cluster into a path that begins at `entry` and, if `exit`
+    /// is given, ends at `exit` (nearest neighbour followed by two-opt)
+    ///
+    /// `entry` and `exit` must be members of the cluster. every member appears exactly once
+    fn cluster_node_order(
+        &self,
+        members: &[usize],
+        entry: usize,
+        exit: Option<usize>,
+    ) -> Vec<usize> {
+        let mut remaining: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|&m| m != entry && Some(m) != exit)
+            .collect();
+
+        let mut order = Vec::with_capacity(members.len());
+        order.push(entry);
+        let mut current_pos = self.scores.node_pos(entry);
+
+        while !remaining.is_empty() {
+            let (idx, _) = remaining
+                .iter()
+                .enumerate()
+                .min_by(|a, b| {
+                    grid_dist(current_pos, self.scores.node_pos(*a.1))
+                        .total_cmp(&grid_dist(current_pos, self.scores.node_pos(*b.1)))
+                })
+                .unwrap();
+            let node = remaining.swap_remove(idx);
+            current_pos = self.scores.node_pos(node);
+            order.push(node);
+        }
+
+        let fixed_end = match exit {
+            Some(e) if e != entry => {
+                order.push(e);
+                true
+            }
+            _ => false,
+        };
+
+        self.two_opt_open_path(&mut order, fixed_end);
+        order
+    }
+
+    /// two-opt on an open path of nodes. the first node is always fixed, and so is the last
+    /// when `fixed_end` is set
+    fn two_opt_open_path(&self, path: &mut [usize], fixed_end: bool) {
+        /// minimum improvement to accept a move (prevents cycling on float noise)
+        const EPSILON: f32 = 1e-4;
+        /// cap on passes over the path
+        const MAX_PASSES: usize = 50;
+
+        let m = path.len();
+        if m < 3 {
+            return;
+        }
+
+        // last index that may be moved
+        let max_j = if fixed_end { m - 2 } else { m - 1 };
+        let pos = |node: usize| self.scores.node_pos(node);
+
+        for _ in 0..MAX_PASSES {
+            let mut improved = false;
+
+            for i in 1..max_j {
+                for j in i + 1..=max_j {
+                    let a = pos(path[i - 1]);
+                    let b = pos(path[i]);
+                    let c = pos(path[j]);
+
+                    let mut delta = grid_dist(a, c) - grid_dist(a, b);
+                    if j + 1 < m {
+                        let d = pos(path[j + 1]);
+                        delta += grid_dist(b, d) - grid_dist(c, d);
+                    }
+
+                    if delta < -EPSILON {
+                        path[i..=j].reverse();
+                        improved = true;
+                    }
+                }
+            }
+
+            if !improved {
+                break;
+            }
+        }
+    }
+
+    /// expands the given path by repeatedly inserting the unvisited node (at the position along
+    /// the path, including the start and end) that maximizes `node_score^2 / additional_cost`,
+    /// as long as the path stays within max cost
+    ///
+    /// assumes the passed score and cost are correct and the path has no duplicate nodes
+    ///
+    /// updates the entry's path, score and cost
+    fn greedy_insertion_path_expand(&self, soln: &mut SolutionInfo) {
+        /// keeps the ratio finite for free insertions
+        const MIN_ADDITIONAL_COST: f32 = 1e-6;
+
+        let node_count = self.scores.node_count();
+        let mut on_path = BitSet::<u64>::with_capacity_general(node_count);
+        for &n in &soln.path {
+            on_path.insert(n);
+        }
+
+        loop {
+            let len = soln.path.len();
+            // (ratio, node, insertion index, additional cost)
+            let mut best: Option<(f32, usize, usize, f32)> = None;
+
+            for node in 0..node_count {
+                if on_path.contains(node) {
+                    continue;
+                }
+                let score = self.scores.get_score_by_index(node);
+                if score <= 0.0 {
+                    continue;
+                }
+                let node_pos = self.scores.node_pos(node);
+
+                for slot in 0..=len {
+                    let prev_pos = if slot == 0 {
+                        self.start_position
+                    } else {
+                        self.scores.node_pos(soln.path[slot - 1])
+                    };
+
+                    let edge = if slot < len {
+                        let next_pos = self.scores.node_pos(soln.path[slot]);
+                        grid_dist(prev_pos, node_pos) + grid_dist(node_pos, next_pos)
+                            - grid_dist(prev_pos, next_pos)
+                    } else {
+                        grid_dist(prev_pos, node_pos)
+                    };
+
+                    let additional = edge * self.distance_multiplier + self.node_cost;
+                    if soln.cost + additional > self.max_cost {
+                        continue;
+                    }
+
+                    let ratio = score * score / additional.max(MIN_ADDITIONAL_COST);
+                    if best.map_or(true, |b| ratio > b.0) {
+                        best = Some((ratio, node, slot, additional));
+                    }
+                }
+            }
+
+            let Some((_, node, slot, additional)) = best else {
+                break;
+            };
+
+            soln.path.insert(slot, node);
+            on_path.insert(node);
+            soln.cost += additional;
+            soln.score += self.scores.get_score_by_index(node);
+        }
+    }
+
     /// applies 2-opt optimization to an existing solution
     /// performs up to the specified amount of passes as a proportion of path width
     fn two_opt_soln(&self, soln: &mut SolutionInfo, compute_time: Duration) {
@@ -1376,4 +1773,61 @@ pub struct SolutionInfo {
     pub path: Vec<usize>,
     pub score: f32,
     pub cost: f32,
+}
+
+/// disjoint set datastructure for nodes
+#[derive(Debug, Clone)]
+struct DisjointNodeSet {
+    map: Vec<usize>,
+    ranks: Vec<usize>,
+}
+
+impl DisjointNodeSet {
+    /// nodes are initialized with themselves as parents and ranks as 0
+    pub fn new(size: usize) -> Self {
+        Self {
+            map: (0..size).collect(),
+            ranks: vec![0; size],
+        }
+    }
+
+    /// gets the representative node in the set of the given node (with path compression)
+    pub fn find(&mut self, node_index: usize) -> usize {
+        let mut root = node_index;
+        while root != self.map[root] {
+            root = self.map[root];
+        }
+
+        // Path compression: point nodes along the path directly to the root
+        let mut curr = node_index;
+        while curr != root {
+            let next = self.map[curr];
+            self.map[curr] = root;
+            curr = next;
+        }
+
+        root
+    }
+
+    /// unions the sets containing the two nodes (using union by rank)
+    pub fn union(&mut self, node1: usize, node2: usize) -> bool {
+        let root1 = self.find(node1);
+        let root2 = self.find(node2);
+
+        if root1 == root2 {
+            return false; // Already in the same set
+        }
+
+        // Attach the smaller rank tree under the root of the higher rank tree
+        if self.ranks[root1] < self.ranks[root2] {
+            self.map[root1] = root2;
+        } else if self.ranks[root1] > self.ranks[root2] {
+            self.map[root2] = root1;
+        } else {
+            self.map[root2] = root1;
+            self.ranks[root1] += 1;
+        }
+
+        true
+    }
 }
