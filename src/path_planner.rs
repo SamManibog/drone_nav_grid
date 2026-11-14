@@ -1,4 +1,9 @@
-use std::{cmp::Ordering, collections::BinaryHeap, ops::Range};
+use std::{
+    cmp::Ordering,
+    collections::BinaryHeap,
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use crate::{
     heap_entries::{MaxHeapEntry, MinHeapEntry},
@@ -663,7 +668,7 @@ impl PathPlanningProblem {
     /// returns (path, score)
     ///
     /// O(n^2)
-    pub fn greedy_score_distance_ratio_soln(&self) -> (Vec<usize>, f32) {
+    pub fn greedy_score_distance_ratio_soln(&self) -> SolutionInfo {
         let mut path = Vec::new();
 
         let mut remaining_cost = self.max_cost;
@@ -681,11 +686,15 @@ impl PathPlanningProblem {
                 &mut total_score,
                 &mut path,
             ) {
-                return (path, total_score);
+                break;
             }
         }
 
-        (path, total_score)
+        SolutionInfo {
+            path,
+            score: total_score,
+            cost: self.max_cost - remaining_cost,
+        }
     }
 
     /// runs an iteration of greedy_score_distance_ratio_soln,
@@ -1152,6 +1161,72 @@ impl PathPlanningProblem {
             }
         }
     }
+
+    /// 2-opt optimized greedy score-distance ratio solution
+    pub fn optimized_greedy_score_distance_ratio_soln(
+        &self,
+        two_opt_compute_time: Duration,
+    ) -> SolutionInfo {
+        let mut soln = self.greedy_score_distance_ratio_soln();
+        self.two_opt_soln(&mut soln, two_opt_compute_time);
+        soln
+    }
+
+    /// applies 2-opt optimization to an existing solution
+    /// performs up to the specified amount of passes as a proportion of path width
+    fn two_opt_soln(&self, soln: &mut SolutionInfo, compute_time: Duration) {
+        /// how often (in candidate moves) to check for exceeding compute time
+        const TIME_CHECK_INTERVAL: u32 = 512;
+        /// minimum improvement to accept a move (prevents cycling on float noise)
+        const EPSILON: f32 = 1e-4;
+
+        let n = soln.path.len();
+        if n < 2 {
+            return;
+        }
+
+        let end_time = Instant::now() + compute_time;
+        let mut checks = 0u32;
+
+        // position of tour index t, where t = 0 is the start and t >= 1 is path[t - 1]
+        let pos = |path: &[usize], t: usize| -> IVec2 {
+            if t == 0 {
+                self.start_position
+            } else {
+                self.scores.node_pos(path[t - 1])
+            }
+        };
+
+        let mut improved = true;
+        while improved {
+            improved = false;
+
+            for i in 0..n {
+                for j in i + 1..=n {
+                    checks = checks.wrapping_add(1);
+                    if checks % TIME_CHECK_INTERVAL == 0 && Instant::now() >= end_time {
+                        return;
+                    }
+
+                    let a = pos(&soln.path, i);
+                    let b = pos(&soln.path, i + 1);
+                    let c = pos(&soln.path, j);
+
+                    let mut delta = grid_dist(a, c) - grid_dist(a, b);
+                    if j < n {
+                        let d = pos(&soln.path, j + 1);
+                        delta += grid_dist(b, d) - grid_dist(c, d);
+                    }
+
+                    if delta < -EPSILON {
+                        soln.path[i..j].reverse();
+                        soln.cost += delta * self.distance_multiplier;
+                        improved = true;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // force evaluation of the compile-time sanity checks on the genetic algorithm's constants
@@ -1304,8 +1379,8 @@ impl Ord for FPriority {
 }
 
 #[derive(Debug, Clone)]
-struct SolutionInfo {
-    path: Vec<usize>,
-    score: f32,
-    cost: f32,
+pub struct SolutionInfo {
+    pub path: Vec<usize>,
+    pub score: f32,
+    pub cost: f32,
 }

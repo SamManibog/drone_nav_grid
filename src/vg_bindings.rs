@@ -6,7 +6,7 @@ pub mod drone_nav_grid {
         prelude::*,
     };
 
-    use std::{path::PathBuf, str::FromStr};
+    use std::{path::PathBuf, str::FromStr, time::Duration};
 
     use crate::{
         math::{Aabb, FVec3, IVec2, IVec3},
@@ -297,13 +297,24 @@ pub mod drone_nav_grid {
         }
 
         /// solves the path planning problem, returning the positions of cells
-        pub fn solve(&self) -> Vec<Vec<isize>> {
-            self.py_emit_soln(self.inner.greedy_score_distance_ratio_soln().0)
+        /// optimization time is provided in milliseconds
+        pub fn solve(&self, optimization_time: f64) -> Vec<Vec<isize>> {
+            self.py_emit_soln(
+                self.inner
+                    .optimized_greedy_score_distance_ratio_soln(Duration::from_secs_f64(
+                        optimization_time * 1000.0,
+                    ))
+                    .path,
+            )
         }
 
         /// solves the path planning problem with a genetic algorithm of the given
         /// generation count
-        pub fn genetic_solve(&self, generation_count: usize, population_size: usize) -> Vec<Vec<isize>> {
+        pub fn genetic_solve(
+            &self,
+            generation_count: usize,
+            population_size: usize,
+        ) -> Vec<Vec<isize>> {
             self.py_emit_soln(self.inner.genetic_soln(generation_count, population_size))
         }
     }
