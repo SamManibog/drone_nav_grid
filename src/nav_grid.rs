@@ -3,7 +3,7 @@ use std::{collections::HashSet, io, path::Path};
 use nalgebra::SimdPartialOrd;
 
 use crate::{
-    math::{Aabb, FVec3, IManhattanDistance, IVec3, LineSegment, floor_fvec3, ivec3_dist_sq},
+    math::{Aabb, FVec2, FVec3, IManhattanDistance, IVec2, IVec3, LineSegment, floor_fvec3, ivec3_dist_sq},
     voxel_grid::{
         cell_identifiers::{CellID, CellPosition},
         chunks::ChunkSize64,
@@ -405,9 +405,65 @@ impl OccupiedExploredNavGrid {
             return (Vec::with_capacity(0), false);
         };
 
-        let (path, success) = self.voxels.funnelled_astar::<IManhattanDistance>(
+        let (path, success) = self.voxels.funnelled_p2p_astar::<IManhattanDistance>(
             start_cell,
             end_cell,
+            search_size,
+            |_, c| ExplOccCell::is_occupied(&c),
+        );
+
+        (
+            path.into_iter()
+                .map(|p| {
+                    self.world_point_from_cell_center(self.voxels.get_cell_position(p).unwrap())
+                })
+                .collect(),
+            success,
+        )
+    }
+
+    /// generate a a path using funnelled astar algorithm to get as near as possible to the given point
+    /// attempts to get as near as possible to the end point within the given search size
+    /// if no path exists, returns an empty vector
+    /// if end is out of bounds, returns an empty vector
+    /// if start is out of bounds, the nearest in-bounds position is chosen instead as a starting point
+    /// if start is inside an occupied cell (e.g. within a safety margin), the nearest unoccupied
+    /// cell is used as the starting point so the agent can path out of the margin
+    /// if the end cell itself is occupied, no path is returned
+    ///
+    /// returns (vec, bool)
+    ///  - a path containing the end point of a path exists, true
+    ///  - a path not containing the endpoint if a path does not exist,
+    ///    this path instead returns the reachable point nearest to the end, false
+    ///  - an empty path if the start or end cells are out of bounds or not traversible, false
+    pub fn column_pathfind(&self, start: FVec3, end_col: FVec2, search_size: usize) -> (Vec<FVec3>, bool) {
+        let proxy_end = FVec3::new(
+            end_col.x,
+            self.offset.y + self.dimensions.y * 0.5,
+            end_col.y,
+        );
+
+        if !self.is_in_bounds(proxy_end) {
+            return (Vec::with_capacity(0), false);
+        }
+
+        let Some(start_cell) = self
+            .voxels
+            .get_cell_id(self.cell_position_from_world_point(start))
+            .and_then(|id| self.nearest_unoccupied_cell(id))
+        else {
+            return (Vec::with_capacity(0), false);
+        };
+
+        let voxel_end_pos = self.cell_position_from_world_point(proxy_end);
+        let voxel_end_col = IVec2::new(
+            voxel_end_pos.x,
+            voxel_end_pos.z,
+        );
+
+        let (path, success) = self.voxels.funnelled_p2c_astar::<IManhattanDistance>(
+            start_cell,
+            voxel_end_col,
             search_size,
             |_, c| ExplOccCell::is_occupied(&c),
         );

@@ -410,16 +410,27 @@ impl<'a, G: Grid<'a>> Iterator for GridSegmentOverlapIter<'a, G> {
     }
 }
 
+/// point-to-column distance heuristic
+pub trait IXyzToXzDistanceHeuristic {
+    /// point (x, y, z)
+    /// column (x, z)
+    fn apply(point: IVec3, col: IVec2) -> u64;
+}
+
 pub trait IDistanceHeuristic {
     fn apply(p1: IVec3, p2: IVec3) -> u64;
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct IManhattanDistance;
-
 impl IDistanceHeuristic for IManhattanDistance {
     fn apply(p1: IVec3, p2: IVec3) -> u64 {
         p1.x.abs_diff(p2.x) as u64 + p1.y.abs_diff(p2.y) as u64 + p1.z.abs_diff(p2.z) as u64
+    }
+}
+impl IXyzToXzDistanceHeuristic for IManhattanDistance {
+    fn apply(point: IVec3, col: IVec2) -> u64 {
+        point.x.abs_diff(col.x) as u64 + point.z.abs_diff(col.y) as u64
     }
 }
 

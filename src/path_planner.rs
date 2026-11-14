@@ -158,9 +158,6 @@ impl PathPlanningProblem {
     /// the number of genetic iterations to run before recalculating scores and costs
     const UNDRIFT_GENETIC_ITERATIONS: usize = 10;
 
-    /// the initial population size as a proportion of maximum possible gene count
-    const POPULATION_SIZE_MULTIPLIER: f32 = 8.0;
-
     /// the smallest population the genetic algorithm will run with. guarantees the
     /// elite/performance/diversity bookkeeping always has individuals to work with
     const MIN_POPULATION_SIZE: usize = 16;
@@ -724,7 +721,7 @@ impl PathPlanningProblem {
             let sd_ratio = if distance == 0.0 {
                 score * 1000.0
             } else {
-                score / distance
+                score * score / distance
             };
 
             if sd_ratio > max_sd_ratio {
@@ -1257,10 +1254,6 @@ impl LinkedPath {
 
     pub const fn len(&self) -> usize {
         self.len
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     /// the last node of the path, if any

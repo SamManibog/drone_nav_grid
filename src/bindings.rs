@@ -9,7 +9,7 @@ pub mod drone_nav_grid {
     use std::{path::PathBuf, str::FromStr, time::Duration};
 
     use crate::{
-        math::{Aabb, FVec3, IVec2, IVec3},
+        math::{Aabb, FVec2, FVec3, IVec2, IVec3},
         nav_grid::{ExplOccCell, OccupiedExploredNavGrid},
         path_planner::{PathPlanningProblem, ScoreGrid},
     };
@@ -19,6 +19,13 @@ pub mod drone_nav_grid {
             py_any.get_item(0)?.extract::<f32>()?,
             py_any.get_item(1)?.extract::<f32>()?,
             py_any.get_item(2)?.extract::<f32>()?,
+        ))
+    }
+
+    fn py_parse_fvec2(py_any: &Bound<'_, PyAny>) -> PyResult<FVec2> {
+        Ok(FVec2::new(
+            py_any.get_item(0)?.extract::<f32>()?,
+            py_any.get_item(1)?.extract::<f32>()?,
         ))
     }
 
@@ -208,6 +215,32 @@ pub mod drone_nav_grid {
             let end = py_parse_fvec3(end)?;
 
             let (path, success) = self.inner.pathfind(start, end, search_size);
+
+            Ok((
+                path.into_iter().map(|p| py_emit_fvec3(p)).collect(),
+                success,
+            ))
+        }
+
+        /// pathfind between a point and column using the given search size
+        ///
+        /// makes a best effort to get to the end point, returning the found path that
+        /// ends nearest to the specified end point
+        ///
+        /// returns a tuple: (path, success)
+        ///  - path is the best-effort path to the endpoint
+        ///     - if the start or endpoints are invalid, path will be empty
+        ///  - success is whether or not the endpoint was successfully found
+        pub fn column_pathfind(
+            &self,
+            start: &Bound<'_, PyAny>,
+            end: &Bound<'_, PyAny>,
+            search_size: usize,
+        ) -> PyResult<(Vec<Vec<f32>>, bool)> {
+            let start = py_parse_fvec3(start)?;
+            let end = py_parse_fvec2(end)?;
+
+            let (path, success) = self.inner.column_pathfind(start, end, search_size);
 
             Ok((
                 path.into_iter().map(|p| py_emit_fvec3(p)).collect(),

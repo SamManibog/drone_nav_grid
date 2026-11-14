@@ -10,7 +10,7 @@ use nalgebra::SimdPartialOrd;
 use crate::{
     math::{
         Aabb, AabbCellIter, FVec3, Grid, GridExt, GridSegmentOverlapIter, IDistanceHeuristic,
-        IVec3, LineSegment,
+        IVec2, IVec3, IXyzToXzDistanceHeuristic, LineSegment,
     },
     voxel_grid::{
         cell_identifiers::{CellID, CellPosition, ChunkID, ChunkPosition, LocalCellPosition},
@@ -279,18 +279,67 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
         })
     }
 
-    /// runs astar between two points, with the given predicate indicating whether a cell is traversible
+    /// runs astar between two points, with the given predicate indicating whether a cell is occupied
+    ///
+    /// returns (vec, bool)
+    ///  - a path containing the end point of a path exists, and true
+    ///  - a path not containing the endpoint if a path does not exist within max_explored budget,
+    ///    this path instead returns the reachable point nearest to the end, and false
+    ///  - an empty path if the start cell is out of bounds or not traversible, and false
+    pub fn p2p_astar<D: IDistanceHeuristic>(
+        &self,
+        start: CellID<S>,
+        end: CellID<S>,
+        max_explored: usize,
+        is_occupied: impl FnMut(CellID<S>, C) -> bool,
+    ) -> (Vec<CellID<S>>, bool) {
+        let end_pos = self.get_cell_position(end).unwrap().0;
+        let distance_heuristic = |pos| D::apply(pos, end_pos);
+        let is_end = |cid| cid == end;
+
+        self.general_astar(start, max_explored, distance_heuristic, is_end, is_occupied)
+    }
+
+    /// runs astar between a point and a column with the given predicate indicating whether a cell is occupied
+    ///
+    /// returns (vec, bool)
+    ///  - a path containing the a point in the end column if a in-budget path exists, and true
+    ///  - a path not containing an in-column endpoint if a path does not exist within max_explored budget,
+    ///    this path instead returns the reachable point nearest to the end, and false
+    ///  - an empty path if the start cell is out of bounds or not traversible, and false
+    pub fn p2c_astar<D: IXyzToXzDistanceHeuristic>(
+        &self,
+        start: CellID<S>,
+        end_column: IVec2,
+        max_explored: usize,
+        is_occupied: impl FnMut(CellID<S>, C) -> bool,
+    ) -> (Vec<CellID<S>>, bool) {
+        let distance_heuristic = |pos| D::apply(pos, end_column);
+        let is_end = |cid| {
+            let pos = self.get_cell_position(cid).unwrap();
+            pos.x == end_column.x && pos.z == end_column.y
+        };
+
+        self.general_astar(start, max_explored, distance_heuristic, is_end, is_occupied)
+    }
+
+    /// runs astar between, with the given predicates indicating whether
+    ///  - a cell meets an end condition (is_end)
+    ///  - a cell is occupied (is_occupied)
+    ///
+    ///  please ensure that the distance heuristic handles the is_end predicate's return values properly
     ///
     /// returns (vec, bool)
     ///  - a path containing the end point of a path exists, and true
     ///  - a path not containing the endpoint if a path does not exist,
     ///    this path instead returns the reachable point nearest to the end, and false
-    ///  - an empty path if the start or end cells are out of bounds or not traversible, and false
-    pub fn astar<D: IDistanceHeuristic>(
+    ///  - an empty path if the start cell is out of bounds or not traversible, and false
+    pub fn general_astar(
         &self,
         start: CellID<S>,
-        end: CellID<S>,
         mut max_explored: usize,
+        mut distance_heuristic: impl FnMut(IVec3) -> u64,
+        mut is_end: impl FnMut(CellID<S>) -> bool,
         mut is_occupied: impl FnMut(CellID<S>, C) -> bool,
     ) -> (Vec<CellID<S>>, bool) {
         fn reconstruct_path<S: ChunkSize>(
@@ -313,21 +362,13 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
             return (Vec::with_capacity(0), false);
         }
 
-        // validate start and end cells
+        // validate start cells
         {
             let start_state = match self.get_cell(start) {
                 None => return (Vec::with_capacity(0), false),
                 Some(state) => state,
             };
             if is_occupied(start, start_state) {
-                return (Vec::with_capacity(0), false);
-            }
-
-            let end_state = match self.get_cell(end) {
-                None => return (Vec::with_capacity(0), false),
-                Some(state) => state,
-            };
-            if is_occupied(end, end_state) {
                 return (Vec::with_capacity(0), false);
             }
         }
@@ -342,7 +383,7 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
         }
         impl<S: ChunkSize> PartialEq for AStarCell<S> {
             fn eq(&self, other: &Self) -> bool {
-                self.fscore == other.fscore
+                self.fscore == other.fscore && self.gscore == other.gscore
             }
         }
         impl<S: ChunkSize> Eq for AStarCell<S> {}
@@ -353,12 +394,12 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
         }
         impl<S: ChunkSize> Ord for AStarCell<S> {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                other.fscore.cmp(&self.fscore)
+                other
+                    .fscore
+                    .cmp(&self.fscore)
+                    .then_with(|| self.gscore.cmp(&other.gscore))
             }
         }
-
-        // the position of the end cell
-        let end_position = self.get_cell_position(end).unwrap().0;
 
         // the set of all cells open for exploration
         let mut open_set = BinaryHeap::new();
@@ -369,12 +410,9 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
         // a map from a cell to its gscore (weight of path to start)
         let mut gscore_map: HashMap<CellID<S>, u32> = HashMap::new();
 
-        // the cell with the greatest fscore
+        // the cell with the lowest heuristic
         let mut nearest = start;
-        let mut nearest_heuristic = D::apply(
-            self.get_cell_position(start).unwrap().0,
-            self.get_cell_position(end).unwrap().0,
-        );
+        let mut nearest_heuristic = distance_heuristic(self.get_cell_position(start).unwrap().0);
 
         open_set.push(AStarCell {
             cell: start,
@@ -389,7 +427,7 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
                 continue;
             }
 
-            if current.cell == end {
+            if is_end(current.cell) {
                 return (reconstruct_path(predecessor_map, current.cell), true);
             }
 
@@ -407,8 +445,8 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
                     }
                     gscore_map.insert(neighbor, temp_gscore);
 
-                    let distance_heuristic = D::apply(neighbor_position, end_position);
-                    let fscore = temp_gscore as u64 + distance_heuristic;
+                    let heuristic_value = distance_heuristic(neighbor_position);
+                    let fscore = temp_gscore as u64 + heuristic_value;
 
                     open_set.push(AStarCell {
                         cell: neighbor,
@@ -416,14 +454,15 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
                         gscore: temp_gscore,
                     });
 
-                    if distance_heuristic < nearest_heuristic {
+                    if heuristic_value < nearest_heuristic {
                         nearest = neighbor;
-                        nearest_heuristic = distance_heuristic;
+                        nearest_heuristic = heuristic_value;
                     }
                 }
 
                 if max_explored <= 0 {
-                    return (reconstruct_path(predecessor_map, nearest), false);
+                    let found = is_end(nearest);
+                    return (reconstruct_path(predecessor_map, nearest), found);
                 }
             }
         }
@@ -431,25 +470,15 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
         (reconstruct_path(predecessor_map, nearest), false)
     }
 
-    /// runs astar between two points, with the given predicate indicating whether a cell is traversible
-    ///
-    /// then uses greedy string pulling for path smoothing
-    ///
-    /// returns (vec, bool)
-    ///  - a path containing the end point of a path exists, true
-    ///  - a path not containing the endpoint if a path does not exist,
-    ///    this path instead returns the reachable point nearest to the end, false
-    ///  - an empty path if the start or end cells are out of bounds or not traversible, false
-    pub fn funnelled_astar<D: IDistanceHeuristic>(
+    /// funnel a path through the grid
+    /// the path should not contain any occupied cells
+    pub fn funnel_path(
         &self,
-        start: CellID<S>,
-        end: CellID<S>,
-        max_explored: usize,
+        path: Vec<CellID<S>>,
         mut is_occupied: impl FnMut(CellID<S>, C) -> bool,
-    ) -> (Vec<CellID<S>>, bool) {
-        let (path, success) = self.astar::<D>(start, end, max_explored, &mut is_occupied);
+    ) -> Vec<CellID<S>> {
         if path.len() <= 2 {
-            return (path, success);
+            return path;
         }
 
         let view = VoxelCellView::new(self); // lives across all LOS queries so the cache carries over
@@ -485,7 +514,39 @@ impl<C: Copy + Default + PartialEq, S: ChunkSize, T: ChunkState<C, S>> VoxelGrid
             i = next;
         }
 
-        (smoothed, success)
+        smoothed
+    }
+
+    /// runs astar between two points, with the given predicate indicating whether a cell is traversible
+    ///
+    /// then uses greedy string pulling for path smoothing
+    ///
+    /// returns (vec, bool)
+    ///  - a path containing the end point of a path exists, true
+    ///  - a path not containing the endpoint if a path does not exist,
+    ///    this path instead returns the reachable point nearest to the end, false
+    ///  - an empty path if the start or end cells are out of bounds or not traversible, false
+    pub fn funnelled_p2p_astar<D: IDistanceHeuristic>(
+        &self,
+        start: CellID<S>,
+        end: CellID<S>,
+        max_explored: usize,
+        mut is_occupied: impl FnMut(CellID<S>, C) -> bool,
+    ) -> (Vec<CellID<S>>, bool) {
+        let (path, success) = self.p2p_astar::<D>(start, end, max_explored, &mut is_occupied);
+        (self.funnel_path(path, is_occupied), success)
+    }
+
+    pub fn funnelled_p2c_astar<D: IXyzToXzDistanceHeuristic>(
+        &self,
+        start: CellID<S>,
+        end_column: IVec2,
+        max_explored: usize,
+        mut is_occupied: impl FnMut(CellID<S>, C) -> bool,
+    ) -> (Vec<CellID<S>>, bool) {
+        let (path, success) =
+            self.p2c_astar::<D>(start, end_column, max_explored, &mut is_occupied);
+        (self.funnel_path(path, is_occupied), success)
     }
 
     /// gets a breadth-first traversing iterator around the given cell
