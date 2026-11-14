@@ -91,7 +91,13 @@ impl ScoreGrid {
         grid_pos(index, self.dimensions.x)
     }
 
+    /// returns the score at the given position
+    ///
+    /// # Panics
+    /// panics with a descriptive message if `pos` is outside the grid
+    /// (a negative coordinate would otherwise wrap into a huge index)
     pub fn get_score(&self, pos: IVec2) -> f32 {
+        assert!(self.contains_pos(pos), "position is outside the score grid");
         self.scores[self.node_index(pos)]
     }
 
@@ -117,7 +123,7 @@ pub fn snaking_path(dimensions: IVec2) -> Vec<usize> {
                 path.push(grid_index(IVec2::new(i, j), dimensions.x))
             }
         } else {
-            for j in (0..dimensions.y).into_iter().rev() {
+            for j in (0..dimensions.y).rev() {
                 path.push(grid_index(IVec2::new(i, j), dimensions.x))
             }
         }
@@ -150,6 +156,10 @@ impl PathPlanningProblem {
     /// the initial population size as a proportion of maximum possible gene count
     const POPULATION_SIZE_MULTIPLIER: f32 = 8.0;
 
+    /// the smallest population the genetic algorithm will run with. guarantees the
+    /// elite/performance/diversity bookkeeping always has individuals to work with
+    const MIN_POPULATION_SIZE: usize = 16;
+
     /// the ratio of completely preserved individuals to total population size per generation
     /// elite individuals are not mutated, but may be selected for crossover
     const ELITE_FRACTION: f32 = 0.025;
@@ -167,9 +177,15 @@ impl PathPlanningProblem {
     /// the probability of a crossover
     const CROSSOVER_PROBABILITY: f32 = 0.75;
 
+    /// the maximum number of Dinkelbach iterations used to find the max-efficiency substring
+    /// (converges in a handful of iterations in practice)
+    const MAX_EFFICIENCY_ITERATIONS: usize = 16;
+
     const PASS_FRACTION: f32 =
         Self::ELITE_FRACTION + Self::PERFORMANCE_FRACTION + Self::DIVERSITY_FRACTION;
 
+    /// evaluated at module level (see the `const _` items below the impl block);
+    /// associated consts are otherwise never evaluated unless referenced
     pub const PASS_SIZE_ASSERTION: () = assert!(Self::PASS_FRACTION < 1.0_f32);
     pub const ELITE_FRACTION_ASSERTION: () =
         assert!(Self::ELITE_FRACTION <= Self::PERFORMANCE_FRACTION);
@@ -203,15 +219,16 @@ impl PathPlanningProblem {
 
     /// ensures the problem definition is valid
     pub fn validate(&self) -> Result<(), String> {
-        if self.max_cost < 0.0 && !self.max_cost.is_nan() {
-            return Err("Max cost must be non-negative".to_string());
+        // `!(x >= 0.0)` also rejects NaN
+        if !(self.max_cost >= 0.0) || !self.max_cost.is_finite() {
+            return Err("Max cost must be non-negative and finite".to_string());
         }
 
-        if self.node_cost < 0.0 || !self.node_cost.is_finite() {
+        if !(self.node_cost >= 0.0) || !self.node_cost.is_finite() {
             return Err("Node cost must be non-negative and finite".to_string());
         }
 
-        if self.distance_multiplier < 0.0 || !self.distance_multiplier.is_finite() {
+        if !(self.distance_multiplier >= 0.0) || !self.distance_multiplier.is_finite() {
             return Err("Distance multiplier must be non-negative and finite".to_string());
         }
 
@@ -222,7 +239,43 @@ impl PathPlanningProblem {
         Ok(())
     }
 
-    /// smart deduplication step for a solution with duplicate nodes
+    /// the cost saved by removing node `i` from the path described by `adj`, including the node
+    /// cost. handles head (no prev), tail (no next), and a lone node (neither).
+    ///
+    /// s(i) = score of node i
+    /// c(i, j) = cost of edge between i and j (distance scaled by the distance multiplier)
+    /// r = root/start position
+    /// C = node cost
+    ///
+    /// let path p = x, ..., y, ..., z
+    ///   head:  c(r, x) + c(x, x + 1) - c(r, x + 1) + C
+    ///   inner: c(y - 1, y) + c(y, y + 1) - c(y - 1, y + 1) + C
+    ///   tail:  c(z - 1, z) + C
+    fn removal_savings(&self, adj: &LinkedPath, i: usize) -> f32 {
+        let (prev_opt, next_opt) = adj.neighbours(i);
+        let pos = self.scores.node_pos(i);
+        let prev_pos = if let Some(prev) = prev_opt {
+            self.scores.node_pos(prev)
+        } else {
+            self.start_position
+        };
+
+        let dist = if let Some(next) = next_opt {
+            let next_pos = self.scores.node_pos(next);
+            grid_dist(prev_pos, pos) + grid_dist(pos, next_pos) - grid_dist(prev_pos, next_pos)
+        } else {
+            grid_dist(prev_pos, pos)
+        };
+
+        dist * self.distance_multiplier + self.node_cost
+    }
+
+    /// smart deduplication step for a single duplicated node: keeps only the occurrence whose
+    /// removal would save the least edge cost, and adjusts score and cost accordingly
+    ///
+    /// the incremental cost update treats each removed occurrence independently, which is
+    /// inexact when removed occurrences are adjacent; `smart_dedup` recomputes score and cost
+    /// afterwards to correct for that
     ///
     /// O(n)
     fn smart_dedup_node_helper(&self, soln: &mut SolutionInfo, node_index: usize) {
@@ -234,6 +287,8 @@ impl PathPlanningProblem {
             }
         }
 
+        // edge cost (in cost units, i.e. scaled by the distance multiplier) saved by removing
+        // the occurrence at path index `idx`
         let comparative_path_idx_savings = |idx: usize| -> f32 {
             let pos = self.scores.node_pos(soln.path[idx]);
 
@@ -243,12 +298,14 @@ impl PathPlanningProblem {
                 self.scores.node_pos(soln.path[idx - 1])
             };
 
-            if idx == soln.path.len() - 1 {
+            let dist = if idx == soln.path.len() - 1 {
                 grid_dist(prev_pos, pos)
             } else {
                 let next_pos = self.scores.node_pos(soln.path[idx + 1]);
                 grid_dist(prev_pos, pos) + grid_dist(pos, next_pos) - grid_dist(prev_pos, next_pos)
-            }
+            };
+
+            dist * self.distance_multiplier
         };
 
         // Find the occurrence with the least savings
@@ -298,7 +355,10 @@ impl PathPlanningProblem {
 
     /// smart deduplication step for a solution with duplicate nodes
     ///
-    /// O(n^2)
+    /// score and cost are recomputed from scratch afterwards, since the per-node incremental
+    /// updates are inexact when removed duplicates are adjacent to each other
+    ///
+    /// O(n^2) in the worst case
     fn smart_dedup(&self, soln: &mut SolutionInfo) {
         // construct list of duplicate nodes
         let mut dupes = Vec::new();
@@ -317,55 +377,33 @@ impl PathPlanningProblem {
             }
         };
 
+        if dupes.is_empty() {
+            return;
+        }
+
         // smart dedup on specific node
         for dupe_node in dupes {
             self.smart_dedup_node_helper(soln, dupe_node);
         }
+
+        self.update_score_and_cost(soln);
     }
 
     /// shrinks a solution until it is valid, prioritizing the removal of inefficient edges
+    ///
+    /// the solution's path must not contain duplicate nodes (see `smart_dedup`) and its
+    /// score and cost must be correct
+    ///
+    /// O(nlogn)
     fn greedy_efficiency_path_shrink(&self, soln: &mut SolutionInfo) {
-        let mut path = LinkedPath::from_slice(&soln.path);
-
-        // s(i) = score of node i
-        // c(i, j) = cost of edge between i and j
-        // r = root/start position
-        // C = node cost
-        //
-        // Cost saved by removing node i given the current links. Handles head
-        // (prev == NONE), tail (next == NONE), and a lone node (both NONE).
-        //
-        // let path p = x, ..., y, ..., z
-        //   head:  c(r, x) + c(x, x + 1) - c(r, x + 1) + C
-        //   inner: c(y - 1, y) + c(y, y + 1) - c(y - 1, y + 1) + C
-        //   tail:  c(z - 1, z) + C
-        //
-        // (distances are scaled by the distance multiplier)
-        let savings = |adj: &LinkedPath, i: usize| -> f32 {
-            let (prev_opt, next_opt) = adj.neighbours(i);
-            let pos = self.scores.node_pos(i);
-            let prev_pos = if let Some(prev) = prev_opt {
-                self.scores.node_pos(prev)
-            } else {
-                self.start_position
-            };
-
-            let dist = if let Some(next) = next_opt {
-                let next_pos = self.scores.node_pos(next);
-                grid_dist(prev_pos, pos) + grid_dist(pos, next_pos) - grid_dist(prev_pos, next_pos)
-            } else {
-                grid_dist(prev_pos, pos)
-            };
-
-            dist * self.distance_multiplier + self.node_cost
-        };
+        let mut path = LinkedPath::from_slice(&soln.path, self.scores.node_count());
 
         // efficiency = score created per unit of cost that removal would save.
         // The queue is a max-heap, so negate: the least efficient node pops first.
         // Removals that save nothing are treated as infinitely efficient (never
         // chosen early).
         let priority = |adj: &LinkedPath, i: usize| -> FPriority {
-            let saved = savings(adj, i);
+            let saved = self.removal_savings(adj, i);
             let efficiency = if saved <= 0.0 {
                 f32::INFINITY
             } else {
@@ -389,7 +427,7 @@ impl PathPlanningProblem {
             let (prev_opt, next_opt) = path.neighbours(node_index);
 
             // compute before unlinking
-            soln.cost -= savings(&path, node_index);
+            soln.cost -= self.removal_savings(&path, node_index);
             soln.score -= self.scores.get_score_by_index(node_index);
 
             path.remove(node_index);
@@ -403,7 +441,7 @@ impl PathPlanningProblem {
             }
         }
 
-        soln.path = path.iter().collect();
+        soln.path = path.to_vec();
     }
 
     fn random_spanning_path<T: Rng>(&self, rng: &mut T) -> SolutionInfo {
@@ -451,7 +489,7 @@ impl PathPlanningProblem {
     ///
     /// O(nlogn)
     fn greedy_random_subtractive_soln<T: Rng>(&self, rng: &mut T) -> SolutionInfo {
-        let mut soln = Self::random_spanning_path(&self, rng);
+        let mut soln = self.random_spanning_path(rng);
         self.greedy_efficiency_path_shrink(&mut soln);
         soln
     }
@@ -466,7 +504,6 @@ impl PathPlanningProblem {
 
         let mut heap = BinaryHeap::from_iter(
             (0..self.scores.node_count())
-                .into_iter()
                 .map(|i| MaxHeapEntry(self.scores.get_score_by_index(i), i)),
         );
 
@@ -474,9 +511,12 @@ impl PathPlanningProblem {
 
         let mut current_pos = self.start_position;
 
-        while let Some(MaxHeapEntry(_, index)) = heap.pop()
-            && remaining_cost > 0.0
-        {
+        // check the remaining cost *before* popping so no entry is discarded needlessly
+        while remaining_cost > 0.0 {
+            let Some(MaxHeapEntry(_, index)) = heap.pop() else {
+                break;
+            };
+
             let i_pos = self.scores.node_pos(index);
             let distance = grid_dist(current_pos, i_pos);
             let edge_cost = distance * self.distance_multiplier;
@@ -493,96 +533,82 @@ impl PathPlanningProblem {
         path
     }
 
-    /// modifies the given path either by expanding to maximize score, or shrinking to stay within
-    /// max score
+    /// modifies the given path either by shrinking to stay within max cost, or by expanding to
+    /// use up remaining cost and increase score
     ///
-    /// DOES NOT PERFORM DUPLICATE DETECTION/REMOVAL
+    /// the path must not contain duplicate nodes, and its score and cost must be correct
     ///
-    /// current method for shrinking is to iteratively select and remove the lowest-scoring included
-    /// nodes
+    /// current method for shrinking is to iteratively remove the nodes that create the least
+    /// score per unit of cost saved (see `greedy_efficiency_path_shrink`)
     ///
     /// current method for expansion is running greedy distance/prob algorithm
     fn greedy_path_adjust(&self, entry: &mut SolutionInfo) {
         if entry.cost > self.max_cost {
-            Self::greedy_efficiency_path_shrink(&self, entry);
+            self.greedy_efficiency_path_shrink(entry);
         }
 
-        // only need to attempt expansion if a new node could feasibly be introduced
+        // only need to attempt expansion if a new node could feasibly be introduced.
+        // distinct grid nodes are always at least distance 1 apart, so the cheapest possible
+        // new node costs at least `node_cost + distance_multiplier`
         if entry.cost + self.node_cost + self.distance_multiplier < self.max_cost {
-            Self::greedy_score_distance_ratio_path_expand(&self, entry)
+            self.greedy_score_distance_ratio_path_expand(entry)
         }
     }
 
-    /// shrinks the given path to a valid cost by removing lowest-scoring nodes first
+    /// shrinks the given path to a valid cost by removing lowest-scoring nodes first,
+    /// updating the entry's path, score and cost
     ///
-    /// returns the new score
+    /// the path must not contain duplicate nodes, and its score and cost must be correct
+    ///
+    /// (currently unused; `greedy_efficiency_path_shrink` is preferred)
+    #[allow(dead_code)]
     fn greedy_score_path_shrink(&self, entry: &mut SolutionInfo) {
+        let mut path = LinkedPath::from_slice(&entry.path, self.scores.node_count());
+
         // construct a min heap of score
         let mut heap = BinaryHeap::from_iter(
             entry
                 .path
                 .iter()
-                .map(|i| MinHeapEntry(self.scores.get_score_by_index(*i), *i)),
+                .map(|&i| MinHeapEntry(self.scores.get_score_by_index(i), i)),
         );
 
         // pop from score while invalid
-        while let Some(node) = heap.pop()
-            && entry.cost > self.max_cost
-        {
-            let i = node.1;
-
-            let node_pos = self.scores.node_pos(i);
-
-            // adjust path cost
-            if i == 0 && i == entry.path.len() {
-                // resulting path is empty. no cost, no score
-                entry.path.pop();
-                entry.cost = 0.0;
-                entry.score = 0.0;
-                return;
-            } else if i == entry.path.len() - 1 {
-                entry.cost -= grid_dist(self.scores.node_pos(i - 1), node_pos)
-            } else {
-                let prev_pos = if i == 0 {
-                    self.start_position
-                } else {
-                    self.scores.node_pos(i - 1)
-                };
-
-                let next_pos = self.scores.node_pos(i + 1);
-
-                let original_dist = grid_dist(prev_pos, node_pos) + grid_dist(node_pos, next_pos);
-                let new_dist = grid_dist(prev_pos, next_pos);
-
-                entry.cost -= (new_dist - original_dist) * self.distance_multiplier;
+        while entry.cost > self.max_cost {
+            let Some(MinHeapEntry(_, node_index)) = heap.pop() else {
+                break;
             };
 
-            // adjust score
-            entry.score -= self.scores.get_score_by_index(i);
+            // compute before unlinking
+            entry.cost -= self.removal_savings(&path, node_index);
+            entry.score -= self.scores.get_score_by_index(node_index);
 
-            // remove from path
-            entry.path.remove(i);
+            path.remove(node_index);
         }
+
+        entry.path = path.to_vec();
     }
 
     /// expands the given path based on score/distance greedy algorithm
-    /// assumes the path is non-empty
     ///
-    /// assumes the passed total score and cost are correct
+    /// new nodes are appended to the end of the path, starting from the path's last node
+    /// (or the start position if the path is empty)
     ///
-    /// returns the new score
+    /// assumes the passed score and cost are correct and the path has no duplicate nodes
+    ///
+    /// updates the entry's path, score and cost
     fn greedy_score_distance_ratio_path_expand(&self, entry: &mut SolutionInfo) {
         let mut remaining_cost = self.max_cost - entry.cost;
         let mut current_pos: IVec2 = entry
             .path
-            .first()
+            .last()
             .map_or_else(|| self.start_position, |x| self.scores.node_pos(*x));
 
-        // construct bitset
+        // construct bitset of unexplored nodes (all nodes not already on the path)
         let mut unexplored: BitSet<u64> =
             BitSet::from_bit_vec_general(BitVec::from_elem_general(self.scores.node_count(), true));
         for i in entry.path.iter() {
-            unexplored.insert(*i);
+            unexplored.remove(*i);
         }
 
         while remaining_cost > 0.0 {
@@ -627,7 +653,7 @@ impl PathPlanningProblem {
             prev_pos = curr_pos;
         }
 
-        return (score, node_cost + edge_cost);
+        (score, node_cost + edge_cost)
     }
 
     /// Greedy algorithm that plans an exploration path between grid cells
@@ -724,37 +750,55 @@ impl PathPlanningProblem {
     /// plans an efficient exploration path between grid cells
     ///
     /// algorithm overview:
-    ///     - initial solutions to speed up convergence time:
-    ///         - greedy algorithm that selects the highest probability unvisited node first
-    ///         - greedy algorithm that selects unvisited node with greatest (probability/distance to node)
-    ///     - end condition/output: a list of nodes representing visited
-    ///     - the fitness function: sum of visited node scores
-    ///     - crossover: ox1 crossover followed by greedy shrinking and expansion
-    ///     - mutations:
-    ///         - swap order of visitation of random chunks
-    ///         - change chunk to nearby, unvisited chunk
-    ///     - selection after crossover and mutation:
-    ///         - certain number of top-scoring w or w/o crossover and/or mutation
-    ///         - certain amount of top scoring with crossover and mutation
-    pub fn genetic_soln(&self, passes: usize) -> Vec<usize> {
-        // trivial case
-        if self.max_cost <= 0.0 {
+    ///     - initial population: greedy random subtractive solutions (a random spanning path
+    ///       shrunk by repeatedly removing the least efficient node until it fits the cost)
+    ///     - end condition/output: a list of nodes representing visited nodes, after `passes`
+    ///       generations
+    ///     - the fitness function: score^2 / cost for positive-scoring individuals (rewards both
+    ///       score and efficiency); non-positive scores rank below all positive ones
+    ///     - crossover: heuristic crossover on disjoint pairs, inserting each parent's most
+    ///       efficient substring into the other parent, followed by deduplication and greedy
+    ///       shrinking/expansion so offspring are valid
+    ///     - mutation: nudge random nodes to a nearby, unvisited grid cell; individuals pushed
+    ///       over max cost by a mutation are greedily shrunk back to validity
+    ///     - selection each generation:
+    ///         - a few elites are preserved untouched
+    ///         - top-performing individuals plus a random sample of the rest survive
+    ///         - the population is refilled to its original size by breeding survivors
+    ///     - output: the highest-scoring valid individual, after recomputing every individual's
+    ///       score and cost to remove accumulated floating point drift
+    pub fn genetic_soln(&self, generations: usize, population_size: usize) -> Vec<usize> {
+        // trivial cases
+        if self.max_cost <= 0.0 || self.scores.node_count() == 0 {
             return Vec::new();
         }
 
         let mut rng = rand::rng();
 
-        let max_gene_count = (self.scores.node_count() as f32)
-            .max(self.max_cost / (self.distance_multiplier + self.node_cost));
-
-        let population_size = (max_gene_count as f32 * Self::POPULATION_SIZE_MULTIPLIER) as usize;
+        let population_size = population_size.max(Self::MIN_POPULATION_SIZE);
         let elite_count = f32::ceil(population_size as f32 * Self::ELITE_FRACTION) as usize;
         let performance_count =
             f32::ceil(population_size as f32 * Self::PERFORMANCE_FRACTION) as usize;
         let diversity_count = f32::ceil(population_size as f32 * Self::DIVERSITY_FRACTION) as usize;
-        let pass_count = performance_count + diversity_count;
 
-        let fitness = |soln: &SolutionInfo| soln.score * soln.score / soln.cost;
+        // always leave at least one individual that does not pass, so the diversity sampling
+        // below always has a non-empty range to draw from
+        let pass_count = (performance_count + diversity_count).min(population_size - 1);
+        let performance_count = performance_count.min(pass_count);
+        let elite_count = elite_count.min(performance_count);
+
+        // higher is better. non-positive scores are ranked by score (below every positive
+        // individual) so that squaring cannot make negative scores look good
+        let fitness = |soln: &SolutionInfo| {
+            let v = if soln.score <= 0.0 {
+                soln.score
+            } else if soln.cost <= 0.0 {
+                f32::INFINITY
+            } else {
+                soln.score * soln.score / soln.cost
+            };
+            if v.is_nan() { f32::NEG_INFINITY } else { v }
+        };
 
         // get initial population
         let mut population = Vec::with_capacity(population_size);
@@ -762,54 +806,87 @@ impl PathPlanningProblem {
             population.push(self.greedy_random_subtractive_soln(&mut rng));
         }
 
-        for generation_num in 0..passes {
+        for generation_num in 0..generations {
             if generation_num % Self::UNDRIFT_GENETIC_ITERATIONS == 0 {
                 for soln in population.iter_mut() {
                     self.update_score_and_cost(soln);
                 }
             }
 
-            let mut elites: Vec<SolutionInfo>;
             // cull population
-            {
-                population
-                    .sort_unstable_by(|l, r| (fitness)(r).partial_cmp(&(fitness)(l)).unwrap());
+            population.sort_unstable_by(|l, r| fitness(r).total_cmp(&fitness(l)));
 
-                // copy elites to vector
-                elites = population[0..elite_count].iter().cloned().collect();
+            // copy elites to vector
+            let elites: Vec<SolutionInfo> = population[0..elite_count].to_vec();
 
-                // pick some random solutions for more genetic diversity
-                for swap_index in performance_count..pass_count {
-                    let swap_with = rng.random_range(swap_index..population.len());
-                    population.swap(swap_index, swap_with);
+            // pick some random solutions for more genetic diversity
+            for swap_index in performance_count..pass_count {
+                let swap_with = rng.random_range(swap_index..population.len());
+                population.swap(swap_index, swap_with);
+            }
+
+            // drop those that didnt pass
+            population.truncate(pass_count);
+
+            // crossover among the survivors
+            self.genetic_crossover(&mut rng, &mut population);
+
+            // refill the population back to its original size by breeding random survivors
+            let target_size = population_size - elites.len();
+            let parent_count = population.len();
+            while population.len() < target_size {
+                let p1 = rng.random_range(0..parent_count);
+                let mut p2 = rng.random_range(0..parent_count);
+                if parent_count > 1 && p2 == p1 {
+                    p2 = (p1 + 1) % parent_count;
                 }
 
-                // drain those that didnt pass
-                population.drain(pass_count..population.len());
+                let [off1, off2] =
+                    self.efficiency_heuristic_crossover(&mut rng, &population[p1], &population[p2]);
+                population.push(off1);
+                if population.len() < target_size {
+                    population.push(off2);
+                }
             }
 
-            // perform crossover and mutation
-            self.genetic_crossover(&mut rng, &mut population);
+            // mutate, then repair any individuals that mutation pushed over max cost
             for soln in population.iter_mut() {
                 self.nudge_mutation(&mut rng, soln);
+                if soln.cost > self.max_cost {
+                    self.greedy_efficiency_path_shrink(soln);
+                }
             }
 
-            // re-introduce elites
-            population.append(&mut elites);
+            // re-introduce elites (never mutated)
+            population.extend(elites);
         }
 
-        // return population member with greatest score
+        // remove accumulated drift and make sure every individual is valid before choosing
+        for soln in population.iter_mut() {
+            self.update_score_and_cost(soln);
+            while soln.cost > self.max_cost {
+                self.greedy_efficiency_path_shrink(soln);
+                self.update_score_and_cost(soln);
+            }
+        }
+
+        // return the valid population member with greatest score
         population
             .into_iter()
-            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
-            .unwrap()
-            .path
+            .max_by(|a, b| a.score.total_cmp(&b.score))
+            .map(|soln| soln.path)
+            .unwrap_or_default()
     }
 
     /// performs genetic crossover on an entire generation
+    ///
+    /// the population is shuffled and paired into disjoint pairs, each of which crosses over
+    /// with probability CROSSOVER_PROBABILITY (an odd individual out is left untouched)
     fn genetic_crossover<T: Rng>(&self, rng: &mut T, population: &mut Vec<SolutionInfo>) {
         population.shuffle(rng);
-        for (p1_idx, p2_idx) in (1..population.len()).into_iter().map(|i| (i - 1, i)) {
+        for p1_idx in (0..population.len().saturating_sub(1)).step_by(2) {
+            let p2_idx = p1_idx + 1;
+
             if rng.random_range(0.0..1.0_f32) >= Self::CROSSOVER_PROBABILITY {
                 continue;
             }
@@ -825,61 +902,106 @@ impl PathPlanningProblem {
     /// detects the max-efficiency substring of nodes in a path
     /// returning the end-exclusive range
     ///
-    /// used for heuristic crossover
+    /// efficiency of a substring is its total score divided by its total cost, where the cost
+    /// is the node cost of each node plus the scaled edge cost between consecutive nodes *inside*
+    /// the substring (the edge entering the substring is excluded, as it disappears once the
+    /// substring is extracted and inserted elsewhere)
     ///
-    /// O(n)
-    fn max_efficiency_substring(&self, path: &Vec<usize>) -> Range<usize> {
-        let mut local_max_efficiency;
-        let mut local_max_cost = f32::INFINITY;
-        let mut local_max_score = f32::NEG_INFINITY;
-        let mut local_max_start = 0;
-        let mut local_max_len = 0;
-
-        let mut max_efficiency = 0.0;
-        let mut max_start = 0;
-        let mut max_len = 0;
-
-        let mut prev_pos = self.start_position;
-        for (idx, node) in path.iter().copied().enumerate() {
-            let pos = self.scores.node_pos(node);
-
-            let as_new_cost = grid_dist(prev_pos, pos) * self.distance_multiplier + self.node_cost;
-            let as_new_score = self.scores.get_score_by_index(node);
-            let as_new_efficiency = as_new_score / as_new_cost;
-
-            let with_new_cost = local_max_cost + as_new_cost;
-            let with_new_score = local_max_score + as_new_score;
-            let with_new_efficiency = with_new_score / with_new_cost;
-
-            if as_new_efficiency > with_new_efficiency {
-                local_max_efficiency = as_new_efficiency;
-                local_max_score = as_new_score;
-                local_max_cost = as_new_cost;
-                local_max_start = idx;
-                local_max_len = 1;
-            } else {
-                local_max_efficiency = with_new_efficiency;
-                local_max_score = with_new_score;
-                local_max_cost = with_new_cost;
-                local_max_len += 1;
-            }
-
-            if local_max_efficiency > max_efficiency {
-                max_efficiency = local_max_efficiency;
-                max_start = local_max_start;
-                max_len = local_max_len;
-            }
-
-            prev_pos = pos;
+    /// maximizing a ratio is not directly solvable with Kadane's algorithm, so this uses
+    /// Dinkelbach's method: given a candidate efficiency `lambda`, Kadane's algorithm finds the
+    /// substring maximizing (score - lambda * cost); if that is positive, the substring beats
+    /// `lambda`, so it becomes the new candidate. this converges to the exact optimum in a few
+    /// iterations
+    ///
+    /// returns an empty range for an empty path
+    ///
+    /// O(n) per iteration
+    ///
+    /// used for heuristic crossover
+    fn max_efficiency_substring(&self, path: &[usize]) -> Range<usize> {
+        let n = path.len();
+        if n == 0 {
+            return 0..0;
         }
 
-        max_start..max_start + max_len
+        // keeps the ratio finite if every cost is zero
+        const MIN_COST: f32 = 1e-12;
+
+        let scores: Vec<f32> = path
+            .iter()
+            .map(|&node| self.scores.get_score_by_index(node))
+            .collect();
+
+        // cost of extending a substring so that it includes node k (k >= 1)
+        let mut extend_costs = vec![self.node_cost; n];
+        for k in 1..n {
+            let dist = grid_dist(
+                self.scores.node_pos(path[k - 1]),
+                self.scores.node_pos(path[k]),
+            );
+            extend_costs[k] = dist * self.distance_multiplier + self.node_cost;
+        }
+
+        let ratio = |range: &Range<usize>| -> f32 {
+            let score: f32 = scores[range.clone()].iter().sum();
+            let cost: f32 =
+                self.node_cost + extend_costs[range.start + 1..range.end].iter().sum::<f32>();
+            score / cost.max(MIN_COST)
+        };
+
+        // best substring maximizing sum(score - lambda * cost), and that sum
+        let kadane = |lambda: f32| -> (Range<usize>, f32) {
+            let mut best = 0..1;
+            let mut best_value = f32::NEG_INFINITY;
+
+            let mut cur_value = 0.0;
+            let mut cur_start = 0;
+
+            for k in 0..n {
+                let start_value = scores[k] - lambda * self.node_cost;
+                let extend_value = cur_value + scores[k] - lambda * extend_costs[k];
+
+                if k == 0 || start_value >= extend_value {
+                    cur_value = start_value;
+                    cur_start = k;
+                } else {
+                    cur_value = extend_value;
+                }
+
+                if cur_value > best_value {
+                    best_value = cur_value;
+                    best = cur_start..k + 1;
+                }
+            }
+
+            (best, best_value)
+        };
+
+        let mut best = 0..1;
+        let mut lambda = ratio(&best);
+
+        for _ in 0..Self::MAX_EFFICIENCY_ITERATIONS {
+            let (candidate, value) = kadane(lambda);
+            if value <= 1e-6 {
+                break;
+            }
+
+            let candidate_ratio = ratio(&candidate);
+            if candidate_ratio <= lambda {
+                break;
+            }
+
+            best = candidate;
+            lambda = candidate_ratio;
+        }
+
+        best
     }
 
     /// performs a heuristic double crossover using the max_efficiency_substring algorithm
     ///
-    /// the child inserts parent1's best genes on parent2's genome
-    /// and parent2's best genes onto parent1's genome
+    /// the first child inserts parent1's best genes on parent2's genome
+    /// and the second child inserts parent2's best genes onto parent1's genome
     fn efficiency_heuristic_crossover<T: Rng>(
         &self,
         rng: &mut T,
@@ -903,7 +1025,9 @@ impl PathPlanningProblem {
 
     /// performs a heuristic crossover using the max_efficiency_substring algorithm
     ///
-    /// the child inserts parent1's best genes on parent2's genes
+    /// the child is a copy of dst_parent with src_parent's best genes (`src_range`) inserted at a
+    /// random position that does not split dst_parent's own best genes (`dst_safe_range`),
+    /// followed by deduplication and greedy adjustment so the child is valid
     fn heuristic_crossover_insert_helper<T: Rng>(
         &self,
         rng: &mut T,
@@ -912,26 +1036,26 @@ impl PathPlanningProblem {
         dst_parent: &SolutionInfo,
         dst_safe_range: Range<usize>,
     ) -> SolutionInfo {
-        // select random position for p1 genes that doesnt overlap good range
-        let index = {
-            let raw = rng.random_range(0..dst_parent.path.len());
-            if raw > dst_safe_range.start {
-                raw + dst_safe_range.end
-            } else {
-                raw
-            }
+        // choose an insertion index in 0..=len that does not fall strictly inside the safe
+        // range. valid indices are 0..=safe.start and safe.end..=len, which are
+        // (safe.start + 1) + (len - safe.end + 1) choices in total
+        let len = dst_parent.path.len();
+        let before_count = dst_safe_range.start + 1;
+        let after_count = len - dst_safe_range.end + 1;
+
+        let choice = rng.random_range(0..before_count + after_count);
+        let index = if choice < before_count {
+            choice
+        } else {
+            dst_safe_range.end + (choice - before_count)
         };
 
-        // insert p1 genes into that position
+        // insert src genes into that position
         let path: Vec<usize> = dst_parent.path[0..index]
             .iter()
             .copied()
             .chain(src_parent.path[src_range].iter().copied())
-            .chain(
-                dst_parent.path[index..dst_parent.path.len()]
-                    .iter()
-                    .copied(),
-            )
+            .chain(dst_parent.path[index..len].iter().copied())
             .collect();
 
         let mut offspring = SolutionInfo {
@@ -948,6 +1072,8 @@ impl PathPlanningProblem {
         offspring
     }
 
+    /// replaces the node at `index` of the path with `new_node`, updating the solution's
+    /// score and cost incrementally
     fn nudge_node(&self, soln: &mut SolutionInfo, index: usize, new_node: usize) {
         let old_node = soln.path[index];
         let old_pos = self.scores.node_pos(old_node);
@@ -961,7 +1087,8 @@ impl PathPlanningProblem {
         };
 
         // modify cost
-        let distance_delta = if index == soln.path.len() {
+        let distance_delta = if index + 1 == soln.path.len() {
+            // last node: there is no outgoing edge
             grid_dist(prev_pos, new_pos) - grid_dist(prev_pos, old_pos)
         } else {
             let next_pos = self.scores.node_pos(soln.path[index + 1]);
@@ -974,60 +1101,70 @@ impl PathPlanningProblem {
         soln.cost += distance_delta * self.distance_multiplier;
 
         // modify score
-        soln.score += self.scores.get_score_by_index(new_node) - self.scores.get_score_by_index(old_node);
+        soln.score +=
+            self.scores.get_score_by_index(new_node) - self.scores.get_score_by_index(old_node);
+
+        // apply the change
+        soln.path[index] = new_node;
     }
 
-    /// mutates a path by moving a few random nodes by a random amount
-    /// mutations may cause the individual to exceed max cost
+    /// mutates a path by moving a few random nodes to a nearby, unvisited grid cell
+    ///
+    /// mutations may cause the individual to exceed max cost; callers are responsible for
+    /// repairing such individuals (see `genetic_soln`)
     fn nudge_mutation<T: Rng>(&self, rng: &mut T, entry: &mut SolutionInfo) {
-        // add contained nodes to range
-        let mut used = BitSet::<u64>::with_capacity_general(entry.path.len());
+        // record which grid nodes are already on the path
+        let mut used = BitSet::<u64>::with_capacity_general(self.scores.node_count());
         for i in &entry.path {
             used.insert(*i);
         }
 
         // note that entry length will not change by nudging entries
-        'gene_loop: for node_index in 0..entry.path.len() {
-            let random_var: f32 = rng.random_range(0.0_f32..=1.0_f32);
-            if random_var > Self::MUTATION_PROBABILITY {
+        'gene_loop: for path_index in 0..entry.path.len() {
+            if rng.random_range(0.0_f32..1.0_f32) >= Self::MUTATION_PROBABILITY {
                 continue 'gene_loop;
             }
 
-            let node_position = self.scores.node_pos(node_index);
+            let old_node = entry.path[path_index];
+            let old_position = self.scores.node_pos(old_node);
 
-            let mut nudge_index = rng.random_range(0..Self::NUDGE_MUTATION_DELTAS.len());
-            let stop_index = nudge_index;
+            // attempt each possible nudge once, starting at a random one, until one is valid
+            let start_delta = rng.random_range(0..Self::NUDGE_MUTATION_DELTAS.len());
+            for offset in 0..Self::NUDGE_MUTATION_DELTAS.len() {
+                let delta_index = (start_delta + offset) % Self::NUDGE_MUTATION_DELTAS.len();
+                let new_position = old_position + Self::NUDGE_MUTATION_DELTAS[delta_index].coords;
 
-            // attempt to nudge for all possible nudges
-            'nudge_attempt_loop: {
-                let new_position = node_position + Self::NUDGE_MUTATION_DELTAS[nudge_index].coords;
-                if self.scores.contains_pos(node_position) {
-                    let new_node_index = self.scores.node_index(new_position);
-                    if !used.contains(new_node_index) {
-                        self.nudge_node(entry, node_index, new_node_index);
-
-                        used.remove(node_index);
-                        used.insert(new_node_index);
-
-                        break 'nudge_attempt_loop;
-                    }
+                if !self.scores.contains_pos(new_position) {
+                    continue;
                 }
 
-                nudge_index += 1;
-                nudge_index %= Self::NUDGE_MUTATION_DELTAS.len();
-
-                if nudge_index == stop_index {
-                    break 'nudge_attempt_loop;
+                let new_node = self.scores.node_index(new_position);
+                if used.contains(new_node) {
+                    continue;
                 }
+
+                self.nudge_node(entry, path_index, new_node);
+
+                used.remove(old_node);
+                used.insert(new_node);
+
+                continue 'gene_loop;
             }
         }
     }
 }
 
+// force evaluation of the compile-time sanity checks on the genetic algorithm's constants
+const _: () = PathPlanningProblem::PASS_SIZE_ASSERTION;
+const _: () = PathPlanningProblem::ELITE_FRACTION_ASSERTION;
+
+/// a path stored as a doubly linked list inside a flat array indexed by grid node id,
+/// allowing O(1) removal of a node
 #[derive(Debug, Clone)]
 struct LinkedPath {
     head: usize,
     tail: usize,
+    /// (prev, next) links for every grid node id; (NONE, NONE) for nodes not on the path
     adj_map: Vec<(usize, usize)>,
     len: usize,
 }
@@ -1047,6 +1184,16 @@ impl LinkedPath {
         self.len
     }
 
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// the last node of the path, if any
+    #[allow(dead_code)]
+    pub fn tail(&self) -> Option<usize> {
+        (self.tail != Self::NONE).then_some(self.tail)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = usize> {
         let mut node = self.head;
 
@@ -1062,6 +1209,8 @@ impl LinkedPath {
     }
 
     /// removes the given node from the path
+    ///
+    /// the node must currently be on the path
     pub fn remove(&mut self, node_index: usize) {
         let neighbors = self.neighbours(node_index);
         self.adj_map[node_index] = (Self::NONE, Self::NONE);
@@ -1069,7 +1218,7 @@ impl LinkedPath {
         match neighbors {
             (Some(prev), Some(next)) => {
                 self.adj_map[prev].1 = next;
-                self.adj_map[next].0 = next;
+                self.adj_map[next].0 = prev;
             }
             (Some(prev), None) => {
                 self.adj_map[prev].1 = Self::NONE;
@@ -1098,58 +1247,59 @@ impl LinkedPath {
         out
     }
 
-    pub fn from_slice(slice: &[usize]) -> Self {
-        if slice.len() == 0 {
+    /// builds a linked path from a slice of grid node ids
+    ///
+    /// `node_count` is the number of nodes in the grid, since links are indexed by grid node id
+    /// (not by position in the slice). the slice must not contain duplicate nodes
+    pub fn from_slice(slice: &[usize], node_count: usize) -> Self {
+        let mut adj_map = vec![(Self::NONE, Self::NONE); node_count];
+
+        if slice.is_empty() {
             return Self {
                 head: Self::NONE,
                 tail: Self::NONE,
-                adj_map: Vec::new(),
+                adj_map,
                 len: 0,
             };
         }
 
         let head = slice[0];
-        let mut tail = head;
         let mut prev = head;
 
-        let mut adj_map = vec![(Self::NONE, Self::NONE); slice.len()];
-
-        for node in slice.iter().skip(1).cloned() {
+        for &node in slice.iter().skip(1) {
+            adj_map[prev].1 = node;
             adj_map[node].0 = prev;
 
             prev = node;
-            tail = node;
         }
 
         Self {
             head,
-            tail,
+            tail: prev,
             adj_map,
             len: slice.len(),
         }
     }
 }
 
+/// a totally ordered f32 wrapper (via `f32::total_cmp`), so NaN can never cause a panic
 #[derive(Debug, Clone, Copy)]
 struct FPriority(pub f32);
 
 impl PartialEq for FPriority {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-    fn ne(&self, other: &Self) -> bool {
-        self.0 != other.0
+        self.cmp(other) == Ordering::Equal
     }
 }
 impl Eq for FPriority {}
 impl PartialOrd for FPriority {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 impl Ord for FPriority {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.partial_cmp(&other.0).unwrap()
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -1158,12 +1308,4 @@ struct SolutionInfo {
     path: Vec<usize>,
     score: f32,
     cost: f32,
-}
-
-/// colleciton of fitness functions
-#[allow(unused)]
-mod fitness {
-    pub fn score_efficiency(score: f32, cost: f32) -> f32 {
-        score * score / cost
-    }
 }

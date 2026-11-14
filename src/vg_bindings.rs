@@ -303,8 +303,8 @@ pub mod drone_nav_grid {
 
         /// solves the path planning problem with a genetic algorithm of the given
         /// generation count
-        pub fn genetic_solve(&self, generation_count: usize) -> Vec<Vec<isize>> {
-            self.py_emit_soln(self.inner.genetic_soln(generation_count))
+        pub fn genetic_solve(&self, generation_count: usize, population_size: usize) -> Vec<Vec<isize>> {
+            self.py_emit_soln(self.inner.genetic_soln(generation_count, population_size))
         }
     }
 }
