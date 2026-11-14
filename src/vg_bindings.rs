@@ -1,6 +1,10 @@
 #[pyo3::pymodule(name = "drone_nav_grid")]
 pub mod drone_nav_grid {
-    use pyo3::{PyAny, exceptions::{PyException, PyValueError}, prelude::*};
+    use pyo3::{
+        PyAny,
+        exceptions::{PyException, PyValueError},
+        prelude::*,
+    };
 
     use std::{path::PathBuf, str::FromStr};
 
@@ -70,8 +74,15 @@ pub mod drone_nav_grid {
             let min = py_parse_fvec3(min)?;
             let max = py_parse_fvec3(max)?;
 
-            if !min.coords.iter().chain(max.coords.iter()).all(|v| v.is_finite()) {
-                return Err(pyo3::exceptions::PyValueError::new_err("min and max must be finite."));
+            if !min
+                .coords
+                .iter()
+                .chain(max.coords.iter())
+                .all(|v| v.is_finite())
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "min and max must be finite.",
+                ));
             }
 
             if Aabb::<FVec3>::new(min, max).is_empty() {
@@ -154,10 +165,14 @@ pub mod drone_nav_grid {
             let start = py_parse_fvec3(start)?;
 
             if !range.is_finite() || range < 0.0 {
-                return Err(PyValueError::new_err("range must be finite and non-negative"));
+                return Err(PyValueError::new_err(
+                    "range must be finite and non-negative",
+                ));
             }
             if !safety_margin.is_finite() || safety_margin < 0.0 {
-                return Err(PyValueError::new_err("safety_margin must be finite and non-negative"));
+                return Err(PyValueError::new_err(
+                    "safety_margin must be finite and non-negative",
+                ));
             }
 
             let mut ep_vec: Vec<FVec3> = Vec::new();
@@ -237,6 +252,16 @@ pub mod drone_nav_grid {
         inner: PathPlanningProblem,
     }
 
+    impl PyPathPlanningProblem {
+        fn py_emit_soln(&self, soln: Vec<usize>) -> Vec<Vec<isize>> {
+            self.inner
+                .scores
+                .map_indices(soln.into_iter())
+                .map(py_emit_ivec2)
+                .collect()
+        }
+    }
+
     #[pymethods]
     impl PyPathPlanningProblem {
         /// constructs a new path planning problem
@@ -273,12 +298,13 @@ pub mod drone_nav_grid {
 
         /// solves the path planning problem, returning the positions of cells
         pub fn solve(&self) -> Vec<Vec<isize>> {
-            let soln = self.inner.greedy_score_distance_ratio_soln().0;
-            self.inner
-                .scores
-                .map_indices(soln.into_iter())
-                .map(py_emit_ivec2)
-                .collect()
+            self.py_emit_soln(self.inner.greedy_score_distance_ratio_soln().0)
+        }
+
+        /// solves the path planning problem with a genetic algorithm of the given
+        /// generation count
+        pub fn genetic_solve(&self, generation_count: usize) -> Vec<Vec<isize>> {
+            self.py_emit_soln(self.inner.genetic_soln(generation_count))
         }
     }
 }
