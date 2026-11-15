@@ -643,7 +643,7 @@ impl PathPlanningProblem {
 
     /// Greedy algorithm that plans an exploration path between grid cells
     ///
-    /// the next chosen cell is the one that maximizes (score/distance)
+    /// the next chosen cell is the one that maximizes (score + 1)^2 / distance
     ///
     /// returns (path, score)
     ///
@@ -704,7 +704,8 @@ impl PathPlanningProblem {
             let sd_ratio = if distance == 0.0 {
                 score * 1000.0
             } else {
-                score * score / distance
+                let score_adjusted = score + 1.0;
+                score_adjusted * score_adjusted / distance
             };
 
             if sd_ratio > max_sd_ratio {
