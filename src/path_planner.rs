@@ -1153,15 +1153,359 @@ impl PathPlanningProblem {
         soln
     }
 
-// Replace the existing `greedy_clustering_soln` (the one ending in `todo!()`) inside
-// `impl PathPlanningProblem` with everything below. No new imports are needed.
+    /// greedy solution with a multi-pass strategy
+    ///
+    /// the general strategy is as follows
+    ///  - collect nodes into high-scoring clusters (see `detect_score_clusters`)
+    ///    - determine the top scoring node not yet in a cluster
+    ///    - if adjacent (8-connected) to a cluster, add it to that cluster (joining all the
+    ///      clusters it is adjacent to into one), otherwise it starts a cluster of its own
+    ///    - repeat until max(1, node_count * TOP_NODE_FRACTION) nodes have been added to a
+    ///      cluster
+    ///  - determine path between clusters
+    ///    - for each cluster, determine total score and expected cost
+    ///      - the node cost is exact, and the edge cost is lower bounded by
+    ///        distance_multiplier * (cluster node count - 1), as the nodes are adjacent
+    ///        (the edge entering the cluster is accounted for when choosing the cluster)
+    ///    - greedily select the next cluster that maximizes value^2 / cost
+    ///      - value = average score of the next cluster's nodes above the average node score,
+    ///        scaled by (node count)^SIZE_WEIGHT (a cluster of ordinary nodes is worth nothing
+    ///        extra, and with SIZE_WEIGHT = 0 a big cluster is not worth more than a small one
+    ///        of equally high-scoring nodes)
+    ///      - cost = distance(nearest node in current, nearest node in next) * distance_multiplier
+    ///        (the cost of the cluster itself is not weighed when ranking clusters)
+    ///      - selection stops once the estimated cost (which does include each selected
+    ///        cluster's own lower-bound cost) exceeds the truncation limit, as anything
+    ///        selected afterwards would be truncated away anyway
+    ///  - for each cluster, determine the path through the nodes in the cluster (entry and
+    ///    exit nodes are determined by the incoming/outgoing cluster links)
+    ///    - join nodes by nearest neighbour
+    ///    - run two-opt on that path (with the entry and, if there is one, the exit node fixed)
+    ///  - if generated path exceeds max_cost * TRUNCATION_COST_FACTOR (this leaves some room
+    ///    for the more "efficient" optimizations below)
+    ///    - remove nodes from end of the path until generated path.cost <= that limit
+    ///  - (after previous if statement) if path cost exceeds max_cost,
+    ///    - run greedy_efficiency_path_shrink
+    ///  - else
+    ///    - the generated path can be extended, so greedily insert the node and edge to insert
+    ///      on that maximize `node_score^2 / additional_cost`
+    ///
+    /// cluster selection is O(T^2) in the number of clustered nodes T in the worst case,
+    /// and gap filling is O(n * path_len) per inserted node
+    pub fn greedy_cluster_truncating_soln(&self) -> SolutionInfo {
+        /// the ratio of nodes (to total node count) that are added to clusters
+        const TOP_NODE_FRACTION: f32 = 0.01;
+        /// the generated path is cut down to this multiple of max cost before the efficiency
+        /// based shrinking, so that shrinking has extra nodes to choose between
+        const TRUNCATION_COST_FACTOR: f32 = 1.2;
+        /// keeps the selection ratio finite for free clusters
+        const MIN_STEP_COST: f32 = 1e-6;
+        /// keeps clusters with no score above the baseline comparable (ties fall back to cost)
+        const MIN_VALUE: f32 = 1e-6;
+        /// how strongly cluster size counts towards a cluster's value: the value is the average
+        /// score above the baseline per node, multiplied by (node count)^SIZE_WEIGHT.
+        /// 0.0 ranks purely by how high-scoring a cluster's nodes are, 1.0 ranks by total score
+        /// (which lets large, mediocre clusters outrank small, high-scoring ones)
+        const SIZE_WEIGHT: f32 = 0.0;
+
+        let empty = || SolutionInfo {
+            path: Vec::new(),
+            score: 0.0,
+            cost: 0.0,
+        };
+
+        if self.scores.node_count() == 0 || self.max_cost <= 0.0 {
+            return empty();
+        }
+
+        let clusters = self.detect_score_clusters(TOP_NODE_FRACTION);
+        if clusters.is_empty() {
+            return empty();
+        }
+        let k = clusters.len();
+
+        // the average score of a node on the grid. visiting an ordinary node earns about this
+        // much, so only score above it is what makes a cluster worth travelling to
+        let baseline = ((0..self.scores.node_count())
+            .map(|i| self.scores.get_score_by_index(i) as f64)
+            .sum::<f64>()
+            / self.scores.node_count() as f64) as f32;
+
+        // value and expected (lower bound) cost of each cluster
+        // value = average score above the baseline per node, scaled by size^SIZE_WEIGHT
+        let cluster_values: Vec<f32> = clusters
+            .iter()
+            .map(|members| {
+                let count = members.len() as f32;
+                let total_excess: f32 = members
+                    .iter()
+                    .map(|&n| self.scores.get_score_by_index(n) - baseline)
+                    .sum();
+                (total_excess / count).max(0.0) * count.powf(SIZE_WEIGHT)
+            })
+            .collect();
+        let cluster_costs: Vec<f32> = clusters
+            .iter()
+            .map(|members| {
+                self.node_cost * members.len() as f32
+                    + self.distance_multiplier * (members.len() - 1) as f32
+            })
+            .collect();
+
+        // greedily choose the order of the clusters
+        // for the i-th chosen cluster: `entries[i]` is the node it is entered at, and `exits[i]`
+        // is the node it is left from (None for the last chosen cluster)
+        let truncation_limit = self.max_cost * TRUNCATION_COST_FACTOR;
+        let mut visited = vec![false; k];
+        let mut order: Vec<usize> = Vec::new();
+        let mut entries: Vec<usize> = Vec::new();
+        let mut exits: Vec<Option<usize>> = Vec::new();
+        let mut estimated_cost = 0.0;
+
+        while order.len() < k {
+            // (ratio, cluster, exit node of current, entry node of cluster, step cost)
+            let mut best: Option<(f32, usize, usize, usize, f32)> = None;
+
+            for c in 0..k {
+                if visited[c] {
+                    continue;
+                }
+
+                let (dist, exit, entry) = match order.last() {
+                    Some(&current) => self.closest_node_pair(&clusters[current], &clusters[c]),
+                    None => {
+                        let (dist, entry) =
+                            self.closest_node_to_position(self.start_position, &clusters[c]);
+                        (dist, usize::MAX, entry)
+                    }
+                };
+
+                // clusters are ranked by the cost of travelling to them only. the cost of the
+                // cluster itself is still counted in the estimate used to stop selecting
+                let travel_cost = dist * self.distance_multiplier;
+                let step_cost = cluster_costs[c] + travel_cost;
+                let value = cluster_values[c] + MIN_VALUE + 1.0;
+                let ratio = value * value * value * value / travel_cost.max(MIN_STEP_COST);
+
+                if best.map_or(true, |b| ratio > b.0) {
+                    best = Some((ratio, c, exit, entry, step_cost));
+                }
+            }
+
+            // there is always an unvisited cluster inside this loop
+            let (_, c, exit, entry, step_cost) = best.unwrap();
+
+            if let Some(last_exit) = exits.last_mut() {
+                *last_exit = Some(exit);
+            }
+            visited[c] = true;
+            order.push(c);
+            entries.push(entry);
+            exits.push(None);
+
+            estimated_cost += step_cost;
+            if estimated_cost > truncation_limit {
+                break;
+            }
+        }
+
+        // order the nodes inside each cluster, entering and leaving at the cluster links
+        let mut path = Vec::new();
+        for (i, &c) in order.iter().enumerate() {
+            let members = &clusters[c];
+            let entry = entries[i];
+
+            let exit = exits[i].map(|exit_candidate| {
+                if exit_candidate != entry || members.len() == 1 {
+                    exit_candidate
+                } else {
+                    // entering and leaving at the same node would skip the cluster's interior,
+                    // so leave from the other member closest to the next cluster's entry
+                    let next_entry_pos = self.scores.node_pos(entries[i + 1]);
+                    members
+                        .iter()
+                        .copied()
+                        .filter(|&m| m != entry)
+                        .min_by(|&a, &b| {
+                            grid_dist(self.scores.node_pos(a), next_entry_pos)
+                                .total_cmp(&grid_dist(self.scores.node_pos(b), next_entry_pos))
+                        })
+                        .unwrap()
+                }
+            });
+
+            path.extend(self.cluster_node_order(members, entry, exit));
+        }
+
+        let mut soln = SolutionInfo {
+            path,
+            score: 0.0,
+            cost: 0.0,
+        };
+        self.update_score_and_cost(&mut soln);
+
+        // truncate from the end of the path until the cost is within the truncation limit
+        if soln.cost > truncation_limit {
+            let mut cost = 0.0;
+            let mut prev_pos = self.start_position;
+            let mut keep = 0;
+
+            for &node in &soln.path {
+                let pos = self.scores.node_pos(node);
+                let next_cost = cost + self.node_cost + grid_dist(prev_pos, pos) * self.distance_multiplier;
+                if next_cost > truncation_limit {
+                    break;
+                }
+                cost = next_cost;
+                prev_pos = pos;
+                keep += 1;
+            }
+
+            soln.path.truncate(keep);
+            self.update_score_and_cost(&mut soln);
+        }
+
+        if soln.cost > self.max_cost {
+            // shrink until valid (recomputing to remove drift)
+            while soln.cost > self.max_cost && !soln.path.is_empty() {
+                self.greedy_efficiency_path_shrink(&mut soln);
+                self.update_score_and_cost(&mut soln);
+            }
+        } else {
+            self.greedy_insertion_path_expand(&mut soln);
+            self.update_score_and_cost(&mut soln);
+        }
+
+        soln
+    }
+
+    /// detects clusters of high-scoring nodes, returning the nodes of each cluster
+    ///
+    ///  - nodes are considered in order of descending score. the top scoring node not yet in a
+    ///    cluster joins the cluster of any adjacent (8-connected) node, and all the clusters it
+    ///    is adjacent to are joined into one. if there is no adjacent cluster it starts a
+    ///    cluster of its own
+    ///  - this repeats until max(1, node_count * node_fraction) nodes have been added to
+    ///    clusters, or no remaining node has a positive score
+    ///
+    /// the clusters are therefore the 8-connected components of the top `node_fraction` of
+    /// nodes. the returned clusters are disjoint, non-empty, and each is 8-connected
+    ///
+    /// O(n log n)
+    fn detect_score_clusters(&self, node_fraction: f32) -> Vec<Vec<usize>> {
+        const UNASSIGNED: usize = usize::MAX;
+
+        let node_count = self.scores.node_count();
+        if node_count == 0 {
+            return Vec::new();
+        }
+
+        let max_added = ((node_count as f32 * node_fraction) as usize).max(1);
+
+        // nodes from highest to lowest score
+        let mut ranked = Vec::from_iter(0..node_count);
+        ranked.sort_unstable_by(|&a, &b| {
+            self.scores
+                .get_score_by_index(b)
+                .total_cmp(&self.scores.get_score_by_index(a))
+        });
+
+        // add the top nodes, joining each to the clusters of the nodes adjacent to it
+        // note that disjoint set expects to be for the entire grid
+        let mut sets = DisjointNodeSet::new(node_count);
+        let mut selected = vec![false; node_count];
+        let mut top_nodes = Vec::with_capacity(max_added);
+
+        for node in ranked {
+            if top_nodes.len() >= max_added {
+                break;
+            }
+
+            // later nodes score no higher, so nothing further can qualify
+            if self.scores.get_score_by_index(node) <= 0.0 {
+                break;
+            }
+
+            for adjacent in self.adjacent_nodes(node) {
+                if selected[adjacent] {
+                    sets.union(node, adjacent);
+                }
+            }
+
+            selected[node] = true;
+            top_nodes.push(node);
+        }
+
+        // gather the members of each cluster
+        let mut root_to_cluster = vec![UNASSIGNED; node_count];
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for node in top_nodes {
+            let root = sets.find(node);
+            if root_to_cluster[root] == UNASSIGNED {
+                root_to_cluster[root] = clusters.len();
+                clusters.push(Vec::new());
+            }
+            clusters[root_to_cluster[root]].push(node);
+        }
+
+        clusters
+    }
+
+    /// the indices of the (up to 8) grid nodes adjacent to the given node, diagonals included
+    fn adjacent_nodes(&self, node: usize) -> impl Iterator<Item = usize> + '_ {
+        let pos = self.scores.node_pos(node);
+
+        (-1..=1isize)
+            .flat_map(move |dy| (-1..=1isize).map(move |dx| (dx, dy)))
+            .filter(|&(dx, dy)| dx != 0 || dy != 0)
+            .map(move |(dx, dy)| IVec2::new(pos.x + dx, pos.y + dy))
+            .filter(move |&p| self.scores.contains_pos(p))
+            .map(move |p| self.scores.node_index(p))
+    }
+
+    /// the closest pair of nodes between two non-empty node sets
+    ///
+    /// returns (distance, node in `from`, node in `to`)
+    fn closest_node_pair(&self, from: &[usize], to: &[usize]) -> (f32, usize, usize) {
+        let mut best = (f32::INFINITY, from[0], to[0]);
+
+        for &a in from {
+            let a_pos = self.scores.node_pos(a);
+            for &b in to {
+                let dist = grid_dist(a_pos, self.scores.node_pos(b));
+                if dist < best.0 {
+                    best = (dist, a, b);
+                }
+            }
+        }
+
+        best
+    }
+
+    /// the node of a non-empty node set closest to a position
+    ///
+    /// returns (distance, node)
+    fn closest_node_to_position(&self, pos: IVec2, nodes: &[usize]) -> (f32, usize) {
+        let mut best = (f32::INFINITY, nodes[0]);
+
+        for &n in nodes {
+            let dist = grid_dist(pos, self.scores.node_pos(n));
+            if dist < best.0 {
+                best = (dist, n);
+            }
+        }
+
+        best
+    }
 
     /// greedy solution with a multi-pass strategy
     ///
     /// the general strategy is as follows
     ///  - collect nodes into high-scoring clusters
-    ///    - select top fraction of nodes by score (only nodes with positive score)
-    ///    - join all adjacent (8-connected) nodes in the top fraction into clusters
+    ///    - determine the average score and standard deviation across all nodes
+    ///    - select top nodes (those with score >= average + TOP_STD_DEVS * standard deviation,
+    ///      and a positive score)
+    ///    - join all adjacent (8-connected) nodes in the top group into clusters
     ///  - determine the shortest path between clusters
     ///    - the distance between two clusters is the distance between their closest pair of
     ///      nodes, and that pair is where the path leaves one cluster and enters the other
@@ -1180,8 +1524,9 @@ impl PathPlanningProblem {
     /// the cluster distance matrix is O(k^2) in memory for k clusters, and computing it is
     /// O(t^2) in the number of top nodes t. gap filling is O(n * path_len) per inserted node
     pub fn greedy_clustering_soln(&self) -> SolutionInfo {
-        /// the ratio of nodes to select initially to node count
-        const TOP_RATIO: f32 = 0.2;
+        /// how many standard deviations above the average score a node must be to count as a
+        /// top node (higher values give fewer, tighter clusters)
+        const TOP_STD_DEVS: f32 = 1.0;
         /// minimum improvement to accept a tour two-opt move
         const EPSILON: f32 = 1e-4;
         /// cap on two-opt passes over the cluster tour
@@ -1198,19 +1543,29 @@ impl PathPlanningProblem {
             return empty();
         }
 
-        // select top nodes (highest score first), ignoring nodes that cannot add score
-        let top_nodes: Vec<usize> = {
-            let mut ranked = Vec::from_iter(0..node_count);
-            ranked.sort_unstable_by(|&a, &b| {
-                self.scores
-                    .get_score_by_index(b)
-                    .total_cmp(&self.scores.get_score_by_index(a))
-            });
-            let take = ((node_count as f32 * TOP_RATIO).ceil() as usize).clamp(1, node_count);
-            ranked.truncate(take);
-            ranked.retain(|&i| self.scores.get_score_by_index(i) > 0.0);
-            ranked
-        };
+        // average score and (population) standard deviation across all nodes
+        // (accumulated in f64 to limit rounding error on large grids)
+        let mean = (0..node_count)
+            .map(|i| self.scores.get_score_by_index(i) as f64)
+            .sum::<f64>()
+            / node_count as f64;
+        let variance = (0..node_count)
+            .map(|i| {
+                let d = self.scores.get_score_by_index(i) as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / node_count as f64;
+        let threshold = (mean + TOP_STD_DEVS as f64 * variance.sqrt()) as f32;
+
+        // select top nodes, ignoring nodes that cannot add score
+        // (on a perfectly uniform grid the deviation is zero, so every positive node qualifies)
+        let top_nodes: Vec<usize> = (0..node_count)
+            .filter(|&i| {
+                let score = self.scores.get_score_by_index(i);
+                score > 0.0 && score >= threshold
+            })
+            .collect();
         if top_nodes.is_empty() {
             return empty();
         }
@@ -1458,7 +1813,7 @@ impl PathPlanningProblem {
         /// minimum improvement to accept a move (prevents cycling on float noise)
         const EPSILON: f32 = 1e-4;
         /// cap on passes over the path
-        const MAX_PASSES: usize = 50;
+        const MAX_PASSES: usize = 250;
 
         let m = path.len();
         if m < 3 {

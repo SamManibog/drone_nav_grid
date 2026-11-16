@@ -344,7 +344,8 @@ pub mod drone_nav_grid {
         /// solves the path planning problem, returning the positions of cells
         /// optimization time is provided in milliseconds
         pub fn solve(&self) -> Vec<Vec<isize>> {
-            self.py_emit_soln(self.inner.greedy_clustering_soln().path)
+            //self.py_emit_soln(self.inner.greedy_clustering_soln().path)
+            self.py_emit_soln(self.inner.greedy_cluster_truncating_soln().path)
         }
 
         /// solves the path planning problem with a genetic algorithm of the given
