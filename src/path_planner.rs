@@ -1161,19 +1161,270 @@ impl PathPlanningProblem {
     ///    - if adjacent (8-connected) to a cluster, add it to that cluster (joining all the
     ///      clusters it is adjacent to into one), otherwise it starts a cluster of its own
     ///    - repeat until max(1, node_count * TOP_NODE_FRACTION) nodes have been added to a
-    ///      cluster
+    ///      cluster, or no remaining node has a positive score
     ///  - determine path between clusters
-    ///    - for each cluster, determine total score and expected cost
-    ///      - the node cost is exact, and the edge cost is lower bounded by
+    ///    - for each cluster, determine
+    ///      - total score
+    ///      - excess = average score of its nodes above the baseline (the average score of all
+    ///        nodes on the grid), floored at zero
+    ///      - expected cost: the node cost is exact, and the edge cost is lower bounded by
     ///        distance_multiplier * (cluster node count - 1), as the nodes are adjacent
     ///        (the edge entering the cluster is accounted for when choosing the cluster)
-    ///    - greedily select the next cluster that maximizes value^2 / cost
-    ///      - value = average score of the next cluster's nodes above the average node score,
-    ///        scaled by (node count)^SIZE_WEIGHT (a cluster of ordinary nodes is worth nothing
-    ///        extra, and with SIZE_WEIGHT = 0 a big cluster is not worth more than a small one
-    ///        of equally high-scoring nodes)
-    ///      - cost = distance(nearest node in current, nearest node in next) * distance_multiplier
-    ///        (the cost of the cluster itself is not weighed when ranking clusters)
+    ///    - greedily select the next cluster that maximizes
+    ///      (total score + 1) * (excess + 1)^2 / travel_cost
+    ///      - travel_cost = distance(nearest node in current, nearest node in next) *
+    ///        distance_multiplier (for the first cluster, the distance is from the start
+    ///        position). the cost of the cluster itself is not weighed when ranking clusters
+    ///      - selection stops once the estimated cost (which does include each selected
+    ///        cluster's own lower-bound cost) exceeds max_cost, as the path built from the
+    ///        selected clusters could not fit any more of them
+    ///  - build a minimal path between the key nodes of the clusters based on the following key nodes
+    ///      - the "entry" node of each cluster
+    ///      - the "exit" node of each cluster
+    ///      - the "center" node of each cluster; that is, the node in the cluster closest to the cluster's
+    ///        score-weighted center of mass
+    ///    the minimal path visits each cluster's entry, then center, then exit. if it exceeds
+    ///    max_cost, nodes are removed from the end of the path until it fits
+    ///  - run greedy insertion path expand on that minimal path
+    ///
+    /// cluster selection is O(T^2) in the number of clustered nodes T in the worst case,
+    /// and gap filling is O(n * path_len) per inserted node
+    pub fn greedy_cluster_inserting_solution(&self) -> SolutionInfo {
+        /// the ratio of nodes (to total node count) that are added to clusters
+        const TOP_NODE_FRACTION: f32 = 0.01;
+        /// keeps the selection ratio finite when the travel cost is zero
+        const MIN_TRAVEL_COST: f32 = 1e-6;
+
+        let empty = || SolutionInfo {
+            path: Vec::new(),
+            score: 0.0,
+            cost: 0.0,
+        };
+
+        let node_count = self.scores.node_count();
+        if node_count == 0 || self.max_cost <= 0.0 {
+            return empty();
+        }
+
+        let clusters = self.detect_score_clusters(TOP_NODE_FRACTION);
+        if clusters.is_empty() {
+            return empty();
+        }
+        let k = clusters.len();
+
+        // the average score of a node on the grid
+        let baseline = ((0..node_count)
+            .map(|i| self.scores.get_score_by_index(i) as f64)
+            .sum::<f64>()
+            / node_count as f64) as f32;
+
+        // total score, excess score and expected (lower bound) cost of each cluster
+        let mut cluster_totals = Vec::with_capacity(k);
+        let mut cluster_excesses = Vec::with_capacity(k);
+        let mut cluster_costs = Vec::with_capacity(k);
+        for members in &clusters {
+            let count = members.len() as f32;
+            let total: f32 = members
+                .iter()
+                .map(|&n| self.scores.get_score_by_index(n))
+                .sum();
+
+            cluster_totals.push(total);
+            cluster_excesses.push((total / count - baseline).max(0.0));
+            cluster_costs.push(self.node_cost * count + self.distance_multiplier * (count - 1.0));
+        }
+
+        // greedily choose the order of the clusters
+        // for the i-th chosen cluster: `entries[i]` is the node it is entered at, and `exits[i]`
+        // is the node it is left from (None for the last chosen cluster)
+        let mut visited = vec![false; k];
+        let mut order: Vec<usize> = Vec::new();
+        let mut entries: Vec<usize> = Vec::new();
+        let mut exits: Vec<Option<usize>> = Vec::new();
+        let mut estimated_cost = 0.0;
+
+        while order.len() < k {
+            // (ratio, cluster, exit node of current, entry node of cluster, step cost)
+            let mut best: Option<(f32, usize, usize, usize, f32)> = None;
+
+            for c in 0..k {
+                if visited[c] {
+                    continue;
+                }
+
+                let (dist, exit, entry) = match order.last() {
+                    Some(&current) => self.closest_node_pair(&clusters[current], &clusters[c]),
+                    None => {
+                        let (dist, entry) =
+                            self.closest_node_to_position(self.start_position, &clusters[c]);
+                        (dist, usize::MAX, entry)
+                    }
+                };
+
+                // clusters are ranked by the cost of travelling to them only. the cost of the
+                // cluster itself is still counted in the estimate used to stop selecting
+                let travel_cost = dist * self.distance_multiplier;
+                let step_cost = cluster_costs[c] + travel_cost;
+                let excess = cluster_excesses[c] + 1.0;
+                let ratio =
+                    (cluster_totals[c] + 1.0) * excess * excess / travel_cost.max(MIN_TRAVEL_COST);
+
+                if best.map_or(true, |b| ratio > b.0) {
+                    best = Some((ratio, c, exit, entry, step_cost));
+                }
+            }
+
+            // there is always an unvisited cluster inside this loop
+            let (_, c, exit, entry, step_cost) = best.unwrap();
+
+            if let Some(last_exit) = exits.last_mut() {
+                *last_exit = Some(exit);
+            }
+            visited[c] = true;
+            order.push(c);
+            entries.push(entry);
+            exits.push(None);
+
+            estimated_cost += step_cost;
+            if estimated_cost > self.max_cost {
+                break;
+            }
+        }
+
+        // build the minimal path through the key nodes of each cluster: entry, center, exit
+        let mut path: Vec<usize> = Vec::new();
+        for (i, &c) in order.iter().enumerate() {
+            let members = &clusters[c];
+            let entry = entries[i];
+
+            let exit = exits[i].map(|exit_candidate| {
+                if exit_candidate != entry || members.len() == 1 {
+                    exit_candidate
+                } else {
+                    // entering and leaving at the same node would leave the cluster's other
+                    // nodes unrepresented, so leave from the other member closest to the next
+                    // cluster's entry
+                    let next_entry_pos = self.scores.node_pos(entries[i + 1]);
+                    members
+                        .iter()
+                        .copied()
+                        .filter(|&m| m != entry)
+                        .min_by(|&a, &b| {
+                            grid_dist(self.scores.node_pos(a), next_entry_pos)
+                                .total_cmp(&grid_dist(self.scores.node_pos(b), next_entry_pos))
+                        })
+                        .unwrap()
+                }
+            });
+            let center = self.cluster_center_node(members);
+
+            // key nodes are only added once, even where they coincide
+            path.push(entry);
+            if center != entry && Some(center) != exit {
+                path.push(center);
+            }
+            if let Some(exit) = exit {
+                if exit != entry {
+                    path.push(exit);
+                }
+            }
+        }
+
+        let mut soln = SolutionInfo {
+            path,
+            score: 0.0,
+            cost: 0.0,
+        };
+        self.update_score_and_cost(&mut soln);
+
+        // the minimal path must itself fit in max cost: remove nodes from the end if not
+        if soln.cost > self.max_cost {
+            let mut cost = 0.0;
+            let mut prev_pos = self.start_position;
+            let mut keep = 0;
+
+            for &node in &soln.path {
+                let pos = self.scores.node_pos(node);
+                let next_cost =
+                    cost + self.node_cost + grid_dist(prev_pos, pos) * self.distance_multiplier;
+                if next_cost > self.max_cost {
+                    break;
+                }
+                cost = next_cost;
+                prev_pos = pos;
+                keep += 1;
+            }
+
+            soln.path.truncate(keep);
+            self.update_score_and_cost(&mut soln);
+        }
+
+        // use up the remaining cost on the most efficient insertions
+        self.greedy_insertion_path_expand(&mut soln);
+        self.update_score_and_cost(&mut soln);
+
+        soln
+    }
+
+    /// the node of a non-empty cluster closest to the cluster's score-weighted center of mass
+    ///
+    /// nodes with non-positive scores carry no weight. if no node has a positive score, all
+    /// nodes are weighted equally
+    fn cluster_center_node(&self, members: &[usize]) -> usize {
+        let weight = |node: usize| self.scores.get_score_by_index(node).max(0.0) as f64;
+
+        let use_scores = members.iter().any(|&n| weight(n) > 0.0);
+        let weight_of = |node: usize| if use_scores { weight(node) } else { 1.0 };
+
+        let mut total_weight = 0.0;
+        let mut center_x = 0.0;
+        let mut center_y = 0.0;
+        for &n in members {
+            let pos = self.scores.node_pos(n);
+            let w = weight_of(n);
+            total_weight += w;
+            center_x += w * pos.x as f64;
+            center_y += w * pos.y as f64;
+        }
+        center_x /= total_weight;
+        center_y /= total_weight;
+
+        let dist_sq = |node: usize| {
+            let pos = self.scores.node_pos(node);
+            let dx = pos.x as f64 - center_x;
+            let dy = pos.y as f64 - center_y;
+            dx * dx + dy * dy
+        };
+
+        members
+            .iter()
+            .copied()
+            .min_by(|&a, &b| dist_sq(a).total_cmp(&dist_sq(b)))
+            .unwrap()
+    }
+
+    /// greedy solution with a multi-pass strategy
+    ///
+    /// the general strategy is as follows
+    ///  - collect nodes into high-scoring clusters (see `detect_score_clusters`)
+    ///    - determine the top scoring node not yet in a cluster
+    ///    - if adjacent (8-connected) to a cluster, add it to that cluster (joining all the
+    ///      clusters it is adjacent to into one), otherwise it starts a cluster of its own
+    ///    - repeat until max(1, node_count * TOP_NODE_FRACTION) nodes have been added to a
+    ///      cluster, or no remaining node has a positive score
+    ///  - determine path between clusters
+    ///    - for each cluster, determine
+    ///      - total score
+    ///      - excess = average score of its nodes above the baseline (the average score of all
+    ///        nodes on the grid), floored at zero
+    ///      - expected cost: the node cost is exact, and the edge cost is lower bounded by
+    ///        distance_multiplier * (cluster node count - 1), as the nodes are adjacent
+    ///        (the edge entering the cluster is accounted for when choosing the cluster)
+    ///    - greedily select the next cluster that maximizes
+    ///      (total score + 1) * (excess + 1)^2 / travel_cost
+    ///      - travel_cost = distance(nearest node in current, nearest node in next) *
+    ///        distance_multiplier (for the first cluster, the distance is from the start
+    ///        position). the cost of the cluster itself is not weighed when ranking clusters
     ///      - selection stops once the estimated cost (which does include each selected
     ///        cluster's own lower-bound cost) exceeds the truncation limit, as anything
     ///        selected afterwards would be truncated away anyway
@@ -1200,13 +1451,6 @@ impl PathPlanningProblem {
         const TRUNCATION_COST_FACTOR: f32 = 1.2;
         /// keeps the selection ratio finite for free clusters
         const MIN_STEP_COST: f32 = 1e-6;
-        /// keeps clusters with no score above the baseline comparable (ties fall back to cost)
-        const MIN_VALUE: f32 = 1e-6;
-        /// how strongly cluster size counts towards a cluster's value: the value is the average
-        /// score above the baseline per node, multiplied by (node count)^SIZE_WEIGHT.
-        /// 0.0 ranks purely by how high-scoring a cluster's nodes are, 1.0 ranks by total score
-        /// (which lets large, mediocre clusters outrank small, high-scoring ones)
-        const SIZE_WEIGHT: f32 = 0.0;
 
         let empty = || SolutionInfo {
             path: Vec::new(),
@@ -1233,24 +1477,29 @@ impl PathPlanningProblem {
 
         // value and expected (lower bound) cost of each cluster
         // value = average score above the baseline per node, scaled by size^SIZE_WEIGHT
-        let cluster_values: Vec<f32> = clusters
-            .iter()
-            .map(|members| {
+        let (cluster_values, cluster_costs, cluster_totals) = {
+            let mut cluster_values = Vec::with_capacity(clusters.len());
+            let mut cluster_costs = Vec::with_capacity(clusters.len());
+            let mut cluster_totals = Vec::with_capacity(clusters.len());
+
+            for members in &clusters {
                 let count = members.len() as f32;
-                let total_excess: f32 = members
+                let total_cost: f32 = members
                     .iter()
-                    .map(|&n| self.scores.get_score_by_index(n) - baseline)
+                    .map(|&n| self.scores.get_score_by_index(n))
                     .sum();
-                (total_excess / count).max(0.0) * count.powf(SIZE_WEIGHT)
-            })
-            .collect();
-        let cluster_costs: Vec<f32> = clusters
-            .iter()
-            .map(|members| {
-                self.node_cost * members.len() as f32
-                    + self.distance_multiplier * (members.len() - 1) as f32
-            })
-            .collect();
+                let total_excess = total_cost - (members.len() as f32 * baseline);
+
+                cluster_values.push((total_excess / count).max(0.0));
+
+                cluster_costs.push(self.node_cost * members.len() as f32
+                    + self.distance_multiplier * (members.len() - 1) as f32);
+
+                cluster_totals.push(total_cost);
+            }
+
+            (cluster_values, cluster_costs, cluster_totals)
+        };
 
         // greedily choose the order of the clusters
         // for the i-th chosen cluster: `entries[i]` is the node it is entered at, and `exits[i]`
@@ -1284,8 +1533,9 @@ impl PathPlanningProblem {
                 // cluster itself is still counted in the estimate used to stop selecting
                 let travel_cost = dist * self.distance_multiplier;
                 let step_cost = cluster_costs[c] + travel_cost;
-                let value = cluster_values[c] + MIN_VALUE + 1.0;
-                let ratio = value * value * value * value / travel_cost.max(MIN_STEP_COST);
+                let value = cluster_values[c] + 1.0;
+                let total_mult = cluster_totals[c] + 1.0;
+                let ratio = total_mult * value * value / travel_cost.max(MIN_STEP_COST);
 
                 if best.map_or(true, |b| ratio > b.0) {
                     best = Some((ratio, c, exit, entry, step_cost));
@@ -1352,7 +1602,8 @@ impl PathPlanningProblem {
 
             for &node in &soln.path {
                 let pos = self.scores.node_pos(node);
-                let next_cost = cost + self.node_cost + grid_dist(prev_pos, pos) * self.distance_multiplier;
+                let next_cost =
+                    cost + self.node_cost + grid_dist(prev_pos, pos) * self.distance_multiplier;
                 if next_cost > truncation_limit {
                     break;
                 }
